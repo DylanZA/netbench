@@ -577,8 +577,8 @@ struct IOUringRunner : public RunnerBase {
         cqe_count = io_uring_peek_batch_cqe(&ring, cqes_.data(), cqes_.size());
         for (int i = 0; i < cqe_count; i++) {
           processCqe(cqes_[i]);
-          io_uring_cqe_seen(&ring, cqes_[i]);
         }
+        io_uring_cq_advance(&ring, cqe_count);
       } while (cqe_count > 0 && !cfg_.io_uring_false_limit_cqes);
 
       if (!cqe_count && stopping) {
