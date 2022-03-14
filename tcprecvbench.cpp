@@ -134,6 +134,7 @@ struct io_uring mkIoUring(Config const& cfg) {
   checkedErrno(
       io_uring_queue_init_params(cfg.ring_size, &ring, &params),
       "io_uring_queue_init_params");
+  io_uring_register_ring_fd(&ring);
   return ring;
 }
 
@@ -549,6 +550,8 @@ struct IOUringRunner : public RunnerBase {
     struct __kernel_timespec timeout;
     timeout.tv_sec = 1;
     timeout.tv_nsec = 0;
+
+    io_uring_register_ring_fd(&ring);
 
     while (socks() || !stopping) {
       submit();
