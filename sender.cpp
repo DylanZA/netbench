@@ -445,6 +445,7 @@ class Sender {
           waserror = true;
           kill = true;
           connectErrors_++;
+          maybeTooManyConnectErrors();
         } else {
           // connected no problem
           successConnects_++;
@@ -630,6 +631,16 @@ class Sender {
   }
 
  private:
+  void maybeTooManyConnectErrors() {
+    // bail out early
+    if (connectErrors_ > 100 && connectErrors_ > 100 * successConnects_) {
+      die("too many connection errors: ",
+          connectErrors_,
+          " vs successes: ",
+          successConnects_);
+    }
+  }
+
   SendOptions const cfg_;
   SendBuffers const& buffers;
   std::unique_ptr<IBenchmarkScenario> scenario;
