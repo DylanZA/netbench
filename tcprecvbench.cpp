@@ -244,13 +244,18 @@ class BufferProvider : private boost::noncopyable {
   std::vector<std::vector<char>> buffers_;
 };
 
-template <size_t ReadSize, bool UseBufferProvider, bool UseFixedFiles>
-struct IOUringSockBase : private boost::noncopyable {
-  static constexpr bool kUseBufferProvider = UseBufferProvider;
-  static constexpr bool kUseFixedFiles = UseFixedFiles;
+static constexpr int kUseBufferProviderFlag = 1;
+static constexpr int kUseFixedFilesFlag = 2;
+static constexpr int kLoopRecvFlag = 4;
 
-  explicit IOUringSockBase(int fd) : fd(fd) {}
-  ~IOUringSockBase() {
+template <size_t ReadSize = 4096, size_t Flags = 0>
+struct BasicSock {
+  static constexpr bool kUseBufferProvider = Flags & kUseBufferProviderFlag;
+  static constexpr bool kUseFixedFiles = Flags & kUseFixedFilesFlag;
+  static constexpr bool kShouldLoop = Flags & kLoopRecvFlag;
+  explicit BasicSock(int fd) : fd(fd) {}
+
+  ~BasicSock() {
     if (!closed_) {
       log("socket not closed at destruct");
     }
@@ -267,14 +272,14 @@ struct IOUringSockBase : private boost::noncopyable {
       die("too big send");
     }
     io_uring_prep_send(sqe, fd, &buff[0], len, 0);
-    if (UseFixedFiles) {
+    if (kUseFixedFiles) {
       sqe->flags |= IOSQE_FIXED_FILE;
     }
     do_send -= std::min(len, do_send);
   }
 
   void addRead(struct io_uring_sqe* sqe, BufferProvider& provider) {
-    if (UseBufferProvider) {
+    if (kUseBufferProvider) {
       io_uring_prep_recv(sqe, fd, NULL, provider.sizePerBuffer(), 0);
       sqe->flags |= IOSQE_BUFFER_SELECT;
       sqe->buf_group = BufferProvider::kBgid;
@@ -282,7 +287,7 @@ struct IOUringSockBase : private boost::noncopyable {
       io_uring_prep_recv(sqe, fd, &buff[0], sizeof(buff), 0);
     }
 
-    if (UseFixedFiles) {
+    if (kUseFixedFiles) {
       sqe->flags |= IOSQE_FIXED_FILE;
     }
   }
@@ -299,9 +304,38 @@ struct IOUringSockBase : private boost::noncopyable {
     io_uring_sqe_set_data(sqe, 0);
   }
 
-  int fd;
+  static std::string describeFlags() {
+    return strcat(
+        "readsize=",
+        ReadSize,
+        " loop=",
+        kShouldLoop,
+        " provider=",
+        kUseBufferProvider,
+        " fixedFiles=",
+        kUseFixedFiles);
+  }
 
- protected:
+  int didRead(size_t size, BufferProvider& provider, struct io_uring_cqe* cqe) {
+    // pull remaining data
+    int res = size;
+    int recycleBufferIdx = -1;
+    if (kUseBufferProvider) {
+      recycleBufferIdx = cqe->flags >> 16;
+      didRead(res, provider, recycleBufferIdx);
+    } else {
+      didRead(res);
+    }
+    while (kShouldLoop && res == (int)size) {
+      res = recv(this->fd, buff, sizeof(buff), MSG_NOSIGNAL);
+      if (res > 0) {
+        didRead(res);
+      }
+    }
+    return recycleBufferIdx;
+  }
+
+ private:
   void didRead(size_t n) {
     // normal read from buffer
     didRead(buff, n);
@@ -311,47 +345,16 @@ struct IOUringSockBase : private boost::noncopyable {
     // read from a provided buffer
     didRead(provider.getData(idx), n);
   }
-
- protected:
-  char buff[ReadSize];
-
- private:
   void didRead(char const* b, size_t n) {
     do_send += parser.consume(b, n);
   }
 
+  int fd;
   ProtocolParser parser;
   uint32_t do_send = 0;
   bool closed_ = false;
-};
 
-template <
-    size_t ReadSize = 4096,
-    bool ShouldLoop = true,
-    bool UseBufferProvider = false,
-    bool UseFixedFiles = false>
-struct BasicSock : IOUringSockBase<ReadSize, UseBufferProvider, UseFixedFiles> {
-  using TParent = IOUringSockBase<ReadSize, UseBufferProvider, UseFixedFiles>;
-  explicit BasicSock(int fd) : TParent(fd) {}
-
-  int didRead(size_t size, BufferProvider& provider, struct io_uring_cqe* cqe) {
-    // pull remaining data
-    int res = size;
-    int recycleBufferIdx = -1;
-    if (UseBufferProvider) {
-      recycleBufferIdx = cqe->flags >> 16;
-      TParent::didRead(res, provider, recycleBufferIdx);
-    } else {
-      TParent::didRead(res);
-    }
-    while (ShouldLoop && res == (int)size) {
-      res = recv(this->fd, TParent::buff, sizeof(TParent::buff), MSG_NOSIGNAL);
-      if (res > 0) {
-        TParent::didRead(res);
-      }
-    }
-    return recycleBufferIdx;
-  }
+  char buff[ReadSize];
 };
 
 struct ListenSock : private boost::noncopyable {
@@ -925,6 +928,7 @@ std::unique_ptr<RunnerBase> prep_io_uring(Config const& cfg, uint16_t port) {
   runner->addListenSock(
       mkServerSock(cfg, port, cfg.send_options.ipv6, flags),
       cfg.send_options.ipv6);
+  log("io_uring test using ", TSock::describeFlags());
   return runner;
 }
 
@@ -976,17 +980,14 @@ allRx() {
       {"io_uring",
        [](Config const& cfg) -> Receiver {
          uint16_t port = pickPort(cfg);
-         return Receiver{prep_io_uring<BasicSock<>>(cfg, port), port};
+         return Receiver{
+             prep_io_uring<BasicSock<4096, kLoopRecvFlag>>(cfg, port), port};
        }},
       {"io_uring_fixed_files",
        [](Config const& cfg) -> Receiver {
          uint16_t port = pickPort(cfg);
          return Receiver{
-             prep_io_uring<BasicSock<
-                 4096,
-                 false /* io_uring doesnt set nonblock properly */,
-                 false,
-                 true>>(cfg, port),
+             prep_io_uring<BasicSock<4096, kUseFixedFilesFlag>>(cfg, port),
              port};
        }},
       {"io_uring_d1",
@@ -994,19 +995,20 @@ allRx() {
          auto c2 = cfg;
          c2.max_events = 1;
          uint16_t port = pickPort(c2);
-         return Receiver{prep_io_uring<BasicSock<>>(c2, port), port};
+         return Receiver{
+             prep_io_uring<BasicSock<4096, kLoopRecvFlag>>(c2, port), port};
        }},
       {"io_uring_provided_buff",
        [](Config const& cfg) -> Receiver {
          uint16_t port = pickPort(cfg);
          return Receiver{
-             prep_io_uring<BasicSock<4096, true, true>>(cfg, port), port};
+             prep_io_uring<BasicSock<4096, kUseBufferProviderFlag>>(cfg, port),
+             port};
        }},
       {"io_uring_no_loop_recv",
        [](Config const& cfg) -> Receiver {
          uint16_t port = pickPort(cfg);
-         return Receiver{
-             prep_io_uring<BasicSock<4096, false, false>>(cfg, port), port};
+         return Receiver{prep_io_uring<BasicSock<4096, 0>>(cfg, port), port};
        }},
       {"io_uring_big_buff",
        [](Config const& cfg) -> Receiver {
