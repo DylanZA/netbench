@@ -255,7 +255,7 @@ struct BasicSock {
   static constexpr bool kShouldLoop = Flags & kLoopRecvFlag;
   explicit BasicSock(int fd) : fd(fd) {
     static_assert(
-        kUseFixedFilesFlag != kShouldLoop,
+        !(kUseFixedFiles && kShouldLoop),
         "can't have fixed files and looping, "
         "we don't have the fd to call recv() !");
   }
