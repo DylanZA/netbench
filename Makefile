@@ -6,6 +6,8 @@ SRCS = $(wildcard *.cpp)
 OBJECTS = $(patsubst %.cpp, %.o, $(SRCS))
 TARGET = tcprecvbench
 
+default: $(TARGET)
+
 $(OBJECTS): Makefile
 
 $(TARGET): $(OBJECTS)
@@ -15,7 +17,6 @@ clean:
 	rm -f *.o
 	rm -f $(TARGET)
 
-default: $(TARGET)
 all: default
 
 .depend: $(SRCS) $(HEADERS)
