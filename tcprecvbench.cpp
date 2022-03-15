@@ -64,6 +64,7 @@ struct Config {
   int ring_size = 64;
   int recv_size = 4096;
   int io_uring_buffers = 1024;
+  int io_uring_files = 16000;
   uint16_t use_port = 0;
   bool client_only = false;
   bool server_only = false;
@@ -243,11 +244,16 @@ class BufferProvider : private boost::noncopyable {
   std::vector<std::vector<char>> buffers_;
 };
 
-template <size_t ReadSize, bool UseBufferProvider>
+template <size_t ReadSize, bool UseBufferProvider, bool UseFixedFiles>
 struct IOUringSockBase : private boost::noncopyable {
+  static constexpr bool kUseBufferProvider = UseBufferProvider;
+  static constexpr bool kUseFixedFiles = UseFixedFiles;
+
   explicit IOUringSockBase(int fd) : fd(fd) {}
   ~IOUringSockBase() {
-    close(fd);
+    if (!closed_) {
+      log("socket not closed at destruct");
+    }
   }
 
   uint32_t peekSend() {
@@ -261,6 +267,9 @@ struct IOUringSockBase : private boost::noncopyable {
       die("too big send");
     }
     io_uring_prep_send(sqe, fd, &buff[0], len, 0);
+    if (UseFixedFiles) {
+      sqe->flags |= IOSQE_FIXED_FILE;
+    }
     do_send -= std::min(len, do_send);
   }
 
@@ -272,6 +281,22 @@ struct IOUringSockBase : private boost::noncopyable {
     } else {
       io_uring_prep_recv(sqe, fd, &buff[0], sizeof(buff), 0);
     }
+
+    if (UseFixedFiles) {
+      sqe->flags |= IOSQE_FIXED_FILE;
+    }
+  }
+
+  void doClose() {
+    closed_ = true;
+    ::close(fd);
+  }
+
+  void addClose(struct io_uring_sqe* sqe) {
+    closed_ = true;
+    io_uring_prep_close(sqe, fd);
+    sqe->flags |= IOSQE_FIXED_FILE;
+    io_uring_sqe_set_data(sqe, 0);
   }
 
   int fd;
@@ -287,21 +312,26 @@ struct IOUringSockBase : private boost::noncopyable {
     didRead(provider.getData(idx), n);
   }
 
+ protected:
+  char buff[ReadSize];
+
  private:
   void didRead(char const* b, size_t n) {
     do_send += parser.consume(b, n);
   }
-  char buff[ReadSize];
+
   ProtocolParser parser;
   uint32_t do_send = 0;
+  bool closed_ = false;
 };
 
 template <
     size_t ReadSize = 4096,
     bool ShouldLoop = true,
-    bool UseBufferProvider = false>
-struct BasicSock : IOUringSockBase<ReadSize, UseBufferProvider> {
-  using TParent = IOUringSockBase<ReadSize, UseBufferProvider>;
+    bool UseBufferProvider = false,
+    bool UseFixedFiles = false>
+struct BasicSock : IOUringSockBase<ReadSize, UseBufferProvider, UseFixedFiles> {
+  using TParent = IOUringSockBase<ReadSize, UseBufferProvider, UseFixedFiles>;
   explicit BasicSock(int fd) : TParent(fd) {}
 
   int didRead(size_t size, BufferProvider& provider, struct io_uring_cqe* cqe) {
@@ -315,15 +345,13 @@ struct BasicSock : IOUringSockBase<ReadSize, UseBufferProvider> {
       TParent::didRead(res);
     }
     while (ShouldLoop && res == (int)size) {
-      res = recv(this->fd, buff, sizeof(buff), MSG_NOSIGNAL);
+      res = recv(this->fd, TParent::buff, sizeof(TParent::buff), MSG_NOSIGNAL);
       if (res > 0) {
         TParent::didRead(res);
       }
     }
     return recycleBufferIdx;
   }
-
-  char buff[ReadSize];
 };
 
 struct ListenSock : private boost::noncopyable {
@@ -346,6 +374,7 @@ struct ListenSock : private boost::noncopyable {
   struct sockaddr_in6 addr6;
   socklen_t client_len;
   bool closed = false;
+  int nextAcceptIdx = -1;
 };
 
 template <class TSock>
@@ -359,6 +388,13 @@ struct IOUringRunner : public RunnerBase {
       addBuffer(i);
     }
     submit();
+
+    if (TSock::kUseFixedFiles) {
+      std::vector<int> files(cfg.io_uring_files, -1);
+      checkedErrno(
+          io_uring_register_files(&ring, files.data(), files.size()),
+          "io_uring_register_files");
+    }
   }
 
   ~IOUringRunner() {
@@ -400,7 +436,16 @@ struct IOUringRunner : public RunnerBase {
       ls->client_len = sizeof(ls->addr);
       addr = (struct sockaddr*)&ls->addr;
     }
-    io_uring_prep_accept(sqe, ls->fd, addr, &ls->client_len, SOCK_NONBLOCK);
+    if (TSock::kUseFixedFiles) {
+      if (ls->nextAcceptIdx >= 0) {
+        die("only allowed one accept at a time");
+      }
+      ls->nextAcceptIdx = nextFdIdx();
+      io_uring_prep_accept_direct(
+          sqe, ls->fd, addr, &ls->client_len, SOCK_NONBLOCK, ls->nextAcceptIdx);
+    } else {
+      io_uring_prep_accept(sqe, ls->fd, addr, &ls->client_len, SOCK_NONBLOCK);
+    }
     io_uring_sqe_set_data(sqe, tag(ls, kAccept));
   }
 
@@ -433,7 +478,15 @@ struct IOUringRunner : public RunnerBase {
     int fd = cqe->res;
     ListenSock* ls = untag<ListenSock>(cqe->user_data);
     if (fd >= 0) {
-      TSock* sock = new TSock(fd);
+      int used_fd = fd;
+      if (TSock::kUseFixedFiles) {
+        if (ls->nextAcceptIdx < 0) {
+          die("no nextAcceptIdx");
+        }
+        used_fd = ls->nextAcceptIdx;
+        ls->nextAcceptIdx = -1;
+      }
+      TSock* sock = new TSock(used_fd);
       addRead(sock);
       newSock();
     } else if (!stopping) {
@@ -448,7 +501,7 @@ struct IOUringRunner : public RunnerBase {
     if (stopping) {
       return;
     } else {
-      if (cfg_.io_uring_supports_nonblock_accept) {
+      if (cfg_.io_uring_supports_nonblock_accept && !TSock::kUseFixedFiles) {
         // get any outstanding sockets
         struct sockaddr_in addr;
         struct sockaddr_in6 addr6;
@@ -467,11 +520,9 @@ struct IOUringRunner : public RunnerBase {
           newSock();
         }
       }
-
       addAccept(untag<ListenSock>(cqe->user_data));
     }
   }
-
   void processRead(struct io_uring_cqe* cqe) {
     int amount = cqe->res;
     TSock* sock = untag<TSock>(cqe->user_data);
@@ -494,8 +545,14 @@ struct IOUringRunner : public RunnerBase {
       }
       if (cqe->res < 0 && !stopping) {
         if (cqe->res != -ECONNRESET) {
-          log("unexpected read: ", amount);
+          log("unexpected read: ", amount, " delete ", sock);
         }
+      }
+
+      if (TSock::kUseFixedFiles) {
+        sock->addClose(get_sqe());
+      } else {
+        sock->doClose();
       }
       delete sock;
       delSock();
@@ -514,6 +571,7 @@ struct IOUringRunner : public RunnerBase {
         // be careful if you do something here as kRead might delete sockets.
         // this is ok as we only ever have one read outstanding
         // at once
+        break;
       case kIgnore:
         break;
       default:
@@ -595,6 +653,14 @@ struct IOUringRunner : public RunnerBase {
     }
   }
 
+  int nextFdIdx() {
+    int ret = nextFdIdx_++;
+    if (ret >= cfg_.io_uring_files) {
+      die("too many files, limit is ", ret);
+    }
+    return ret;
+  }
+
   static inline void* tag(void* ptr, int x) {
     size_t uptr;
     memcpy(&uptr, &ptr, sizeof(size_t));
@@ -627,6 +693,7 @@ struct IOUringRunner : public RunnerBase {
   std::vector<struct io_uring_cqe*> cqes_;
   int listeners_ = 0;
   uint32_t enobuffCount_ = 0;
+  int nextFdIdx_ = 0;
 };
 
 static constexpr uint32_t kSocket = 0;
@@ -911,6 +978,17 @@ allRx() {
          uint16_t port = pickPort(cfg);
          return Receiver{prep_io_uring<BasicSock<>>(cfg, port), port};
        }},
+      {"io_uring_fixed_files",
+       [](Config const& cfg) -> Receiver {
+         uint16_t port = pickPort(cfg);
+         return Receiver{
+             prep_io_uring<BasicSock<
+                 4096,
+                 false /* io_uring doesnt set nonblock properly */,
+                 false,
+                 true>>(cfg, port),
+             port};
+       }},
       {"io_uring_d1",
        [](Config const& cfg) -> Receiver {
          auto c2 = cfg;
@@ -969,6 +1047,8 @@ desc.add_options()
 ("send_large_size", po::value(&config.send_options.large_size))
 ("io_uring_buffers", po::value(&config.io_uring_buffers),
  "number of provided buffers")
+("io_uring_files", po::value(&config.io_uring_files),
+ "number of registered files for accept_direct")
 ;
   // clang-format on
 

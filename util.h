@@ -39,11 +39,14 @@ void log(const T&... vals) {
 }
 
 template <typename... T>
-void vlog(const T&... vals) {
+void _vlog(const T&... vals) {
   if (!isVerbose())
     return;
   log(vals...);
 }
+
+#define vlog(...) \
+  _vlog(__FILE__, ":", __LINE__, '(', __FUNCTION__, ") ", __VA_ARGS__)
 
 std::string leftpad(std::string x, size_t n) {
   if (x.size() >= n)

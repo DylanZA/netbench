@@ -463,6 +463,7 @@ class Sender {
           finished = false;
         } else {
           // finished
+          connection->remaining = 0;
         }
         break;
       case ActionOp::Send:
