@@ -634,7 +634,7 @@ class Sender {
  private:
   void maybeTooManyConnectErrors() {
     // bail out early
-    if (connectErrors_ > 100 && connectErrors_ > 100 * successConnects_) {
+    if (connectErrors_ >= 100 && connectErrors_ > 100 * successConnects_) {
       die("too many connection errors: ",
           connectErrors_,
           " vs successes: ",

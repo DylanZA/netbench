@@ -486,6 +486,10 @@ struct IOUringRunner : public RunnerBase {
     if (fd >= 0) {
       int used_fd = fd;
       if (TSock::kUseFixedFiles) {
+        if (fd > 0) {
+          die("trying to use fixed files, but got given an actual fd. "
+              "implies that this kernel does not support this feature");
+        }
         if (ls->nextAcceptIdx < 0) {
           die("no nextAcceptIdx");
         }
