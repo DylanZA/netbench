@@ -582,6 +582,11 @@ struct IOUringRunner : public RunnerBase {
         // be careful if you do something here as kRead might delete sockets.
         // this is ok as we only ever have one read outstanding
         // at once
+        if (cqe->res < 0) {
+          // we should track these down and make sure they only happen when the
+          // sender socket is closed
+          log("bad socket write ", cqe->res);
+        }
         break;
       case kIgnore:
         break;
