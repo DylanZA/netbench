@@ -233,6 +233,7 @@ class BufferProvider : private boost::noncopyable {
   void add(int i, struct io_uring_sqe* sqe) {
     io_uring_prep_provide_buffers(
         sqe, buffers_[i].data(), buffers_[i].size(), 1, kBgid, i);
+    io_uring_sqe_set_data(sqe, NULL);
   }
 
   char const* getData(int i) const {
@@ -413,7 +414,9 @@ struct IOUringRunner : public RunnerBase {
   }
 
   void addBuffer(int i) {
-    buffers_.add(i, get_sqe());
+    auto* sqe = get_sqe();
+    buffers_.add(i, sqe);
+    io_uring_sqe_set_data(sqe, NULL);
   }
 
   static constexpr int kAccept = 1;
@@ -526,13 +529,16 @@ struct IOUringRunner : public RunnerBase {
       addAccept(untag<ListenSock>(cqe->user_data));
     }
   }
+
   void processRead(struct io_uring_cqe* cqe) {
     int amount = cqe->res;
     TSock* sock = untag<TSock>(cqe->user_data);
     if (amount > 0) {
       int recycleBufferIdx = sock->didRead(amount, buffers_, cqe);
       if (recycleBufferIdx > 0) {
-        buffers_.add(recycleBufferIdx, get_sqe());
+        auto* sqe = get_sqe();
+        buffers_.add(recycleBufferIdx, sqe);
+        io_uring_sqe_set_data(sqe, NULL);
       }
       if (uint32_t sends = sock->peekSend(); sends > 0) {
         addSend(sock, sends);
@@ -553,7 +559,9 @@ struct IOUringRunner : public RunnerBase {
       }
 
       if (TSock::kUseFixedFiles) {
-        sock->addClose(get_sqe());
+        auto* sqe = get_sqe();
+        sock->addClose(sqe);
+        io_uring_sqe_set_data(sqe, NULL);
       } else {
         sock->doClose();
       }
