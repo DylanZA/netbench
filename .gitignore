@@ -1,2 +1,4 @@
 TARGETS
 tcprecvbench
+*.o
+.depend

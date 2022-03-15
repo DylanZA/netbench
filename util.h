@@ -20,7 +20,7 @@ namespace {
 template <typename... T>
 std::string strcat(const T&... vals) {
   std::stringstream ss;
-  (ss << ... << vals);
+  (ss << ... << vals) << "";
   return ss.str();
 }
 

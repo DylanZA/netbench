@@ -118,8 +118,6 @@ int mkServerSock(
     uint16_t port,
     bool const isv6,
     int extra_flags) {
-  struct sockaddr_in serv_addr;
-  struct sockaddr_in6 serv_addr6;
   int fd = checkedErrno(mkBasicSock(port, isv6, extra_flags));
   checkedErrno(listen(fd, cfg.backlog), "listen");
   vlog("made sock ", fd, " v6=", isv6, " port=", port);
@@ -316,7 +314,7 @@ struct BasicSock : IOUringSockBase<ReadSize, UseBufferProvider> {
     } else {
       TParent::didRead(res);
     }
-    while (ShouldLoop && res == size) {
+    while (ShouldLoop && res == (int)size) {
       res = recv(this->fd, buff, sizeof(buff), MSG_NOSIGNAL);
       if (res > 0) {
         TParent::didRead(res);
@@ -757,7 +755,7 @@ struct EPollRunner : public RunnerBase {
         ed->to_write += ed->parser.consume(rcvbuff.data(), res);
         reads++;
       }
-    } while (res == rcvbuff.size());
+    } while (res == (int)rcvbuff.size());
     return 0;
   }
 
@@ -798,7 +796,7 @@ struct EPollRunner : public RunnerBase {
       if (!nevents) {
         vlog("epoll: no events socks()=", socks());
       }
-      for (size_t i = 0; i < nevents; ++i) {
+      for (int i = 0; i < nevents; ++i) {
         EPollData* ed = (EPollData*)events[i].data.ptr;
         switch (ed->type) {
           case kAccept4:

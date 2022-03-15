@@ -261,8 +261,6 @@ class Sender {
         die("ipv4 parse error:", dest);
       }
     }
-    struct sockaddr_storage addr_;
-    socklen_t addrLen_;
   }
 
   ~Sender() {
@@ -458,7 +456,7 @@ class Sender {
           vlog("recv bad read: ", res);
           recvErrors_++;
           waserror = true;
-        } else if (res < connection->remaining) {
+        } else if ((size_t)res < connection->remaining) {
           connection->remaining -= res;
           queueRecv(connection, connection->remaining);
           finished = false;
