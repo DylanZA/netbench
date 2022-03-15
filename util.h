@@ -18,19 +18,19 @@ bool isVerbose();
 namespace {
 
 template <typename... T>
-std::string strcat(const T&... vals) {
+inline std::string strcat(const T&... vals) {
   std::stringstream ss;
   (ss << ... << vals) << "";
   return ss.str();
 }
 
 template <typename... T>
-void die(const T&... vals) {
+inline void die(const T&... vals) {
   throw std::runtime_error(strcat(vals...));
 }
 
 template <typename... T>
-void log(const T&... vals) {
+inline void log(const T&... vals) {
   std::stringstream ss;
   ss << "[" << std::fixed << std::setw(9) << std::setprecision(3) << logTime()
      << "] " << strcat(vals...) << "\n";
@@ -39,7 +39,7 @@ void log(const T&... vals) {
 }
 
 template <typename... T>
-void _vlog(const T&... vals) {
+inline void _vlog(const T&... vals) {
   if (!isVerbose())
     return;
   log(vals...);
@@ -48,7 +48,7 @@ void _vlog(const T&... vals) {
 #define vlog(...) \
   _vlog(__FILE__, ":", __LINE__, ':', __FUNCTION__, ' ', __VA_ARGS__)
 
-std::string leftpad(std::string x, size_t n) {
+inline std::string leftpad(std::string x, size_t n) {
   if (x.size() >= n)
     return x;
   return std::string(n - x.size(), ' ') + x;
@@ -57,7 +57,7 @@ std::string leftpad(std::string x, size_t n) {
 struct InterruptedException : std::exception {};
 
 template <typename... T>
-int checkedErrno(int res, const T&... vals) {
+inline int checkedErrno(int res, const T&... vals) {
   if (res < 0) {
     int error = res == -1 ? errno : -res;
     if (error == EINTR) {
@@ -79,12 +79,12 @@ int checkedErrno(int res, const T&... vals) {
 }
 
 template <class T>
-void doSetSockOpt(int fd, int t, int l, T val) {
+inline void doSetSockOpt(int fd, int t, int l, T val) {
   checkedErrno(setsockopt(fd, t, l, &val, sizeof(val)), "doSetSockOpt");
 }
 
 template <class FN>
-auto wrapThread(std::string name, FN&& fn) {
+inline auto wrapThread(std::string name, FN&& fn) {
   return [name, f = std::move(fn)]() mutable {
     if (name.size()) {
       pthread_setname_np(pthread_self(), name.c_str());
