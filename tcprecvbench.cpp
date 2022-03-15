@@ -233,7 +233,6 @@ class BufferProvider : private boost::noncopyable {
   void add(int i, struct io_uring_sqe* sqe) {
     io_uring_prep_provide_buffers(
         sqe, buffers_[i].data(), buffers_[i].size(), 1, kBgid, i);
-    io_uring_sqe_set_data(sqe, NULL);
   }
 
   char const* getData(int i) const {
@@ -254,7 +253,12 @@ struct BasicSock {
   static constexpr bool kUseBufferProvider = Flags & kUseBufferProviderFlag;
   static constexpr bool kUseFixedFiles = Flags & kUseFixedFilesFlag;
   static constexpr bool kShouldLoop = Flags & kLoopRecvFlag;
-  explicit BasicSock(int fd) : fd(fd) {}
+  explicit BasicSock(int fd) : fd(fd) {
+    static_assert(
+        kUseFixedFilesFlag != kShouldLoop,
+        "can't have fixed files and looping, "
+        "we don't have the fd to call recv() !");
+  }
 
   ~BasicSock() {
     if (!closed_) {
@@ -540,9 +544,7 @@ struct IOUringRunner : public RunnerBase {
     if (amount > 0) {
       int recycleBufferIdx = sock->didRead(amount, buffers_, cqe);
       if (recycleBufferIdx > 0) {
-        auto* sqe = get_sqe();
-        buffers_.add(recycleBufferIdx, sqe);
-        io_uring_sqe_set_data(sqe, NULL);
+        addBuffer(recycleBufferIdx);
       }
       if (uint32_t sends = sock->peekSend(); sends > 0) {
         addSend(sock, sends);
@@ -911,10 +913,11 @@ struct EPollRunner : public RunnerBase {
 };
 
 uint16_t pickPort(Config const& config) {
-  static uint16_t startPort = 10000 + rand() % 2000;
+  static uint16_t startPort =
+      config.use_port ? config.use_port : 10000 + rand() % 2000;
   bool v6 = config.send_options.ipv6;
   if (config.use_port) {
-    return config.use_port;
+    return startPort++;
   }
   for (int i = 0; i < 1000; i++) {
     auto port = startPort++;
@@ -998,7 +1001,10 @@ allRx() {
        [](Config const& cfg) -> Receiver {
          uint16_t port = pickPort(cfg);
          return Receiver{
-             prep_io_uring<BasicSock<4096, kLoopRecvFlag>>(cfg, port), port};
+             prep_io_uring<
+                 BasicSock<4096, kUseFixedFilesFlag | kUseBufferProviderFlag>>(
+                 cfg, port),
+             port};
        }},
       {"io_uring_fixed_files",
        [](Config const& cfg) -> Receiver {
@@ -1026,6 +1032,12 @@ allRx() {
        [](Config const& cfg) -> Receiver {
          uint16_t port = pickPort(cfg);
          return Receiver{prep_io_uring<BasicSock<4096, 0>>(cfg, port), port};
+       }},
+      {"io_uring_loop_recv",
+       [](Config const& cfg) -> Receiver {
+         uint16_t port = pickPort(cfg);
+         return Receiver{
+             prep_io_uring<BasicSock<4096, kLoopRecvFlag>>(cfg, port), port};
        }},
       {"io_uring_big_buff",
        [](Config const& cfg) -> Receiver {
@@ -1123,10 +1135,6 @@ desc.add_options()
   }
 
   // validations:
-
-  if (config.use_port && config.rx.size() > 1) {
-    die("can only specify port with <= 1 rx, have ", config.rx.size());
-  }
 
   if (config.server_only && config.client_only) {
     die("only one of server/client only please");
