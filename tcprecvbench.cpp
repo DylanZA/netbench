@@ -924,7 +924,7 @@ allRx() {
          return Receiver{
              prep_io_uring<BasicSock<4096, true, true>>(cfg, port), port};
        }},
-      {"io_uring_plain_recv",
+      {"io_uring_no_loop_recv",
        [](Config const& cfg) -> Receiver {
          uint16_t port = pickPort(cfg);
          return Receiver{
