@@ -65,13 +65,14 @@ struct Config {
   int recv_size = 4096;
   int io_uring_buffers = 1024;
   int io_uring_files = 16000;
-  uint16_t use_port = 0;
+  std::vector<uint16_t> use_port;
   bool client_only = false;
   bool server_only = false;
   SendOptions send_options;
 
   bool io_uring_supports_nonblock_accept = false;
   bool io_uring_false_limit_cqes = false;
+  bool io_uring_register = true;
 
   std::vector<std::string> tx;
   std::vector<std::string> rx;
@@ -133,7 +134,9 @@ struct io_uring mkIoUring(Config const& cfg) {
   checkedErrno(
       io_uring_queue_init_params(cfg.ring_size, &ring, &params),
       "io_uring_queue_init_params");
-  io_uring_register_ring_fd(&ring);
+  if (cfg.io_uring_register) {
+    io_uring_register_ring_fd(&ring);
+  }
   return ring;
 }
 
@@ -392,10 +395,13 @@ struct IOUringRunner : public RunnerBase {
         ring(mkIoUring(cfg)),
         buffers_(cfg.io_uring_buffers, cfg.recv_size) {
     cqes_.resize(cfg.max_events);
-    for (size_t i = 0; i < buffers_.count(); i++) {
-      addBuffer(i);
+
+    if (TSock::kUseBufferProvider) {
+      for (size_t i = 0; i < buffers_.count(); i++) {
+        addBuffer(i);
+      }
+      submit();
     }
-    submit();
 
     if (TSock::kUseFixedFiles) {
       std::vector<int> files(cfg.io_uring_files, -1);
@@ -629,7 +635,9 @@ struct IOUringRunner : public RunnerBase {
     timeout.tv_sec = 1;
     timeout.tv_nsec = 0;
 
-    io_uring_register_ring_fd(&ring);
+    if (cfg_.io_uring_register) {
+      io_uring_register_ring_fd(&ring);
+    }
 
     while (socks() || !stopping) {
       submit();
@@ -914,9 +922,9 @@ struct EPollRunner : public RunnerBase {
 
 uint16_t pickPort(Config const& config) {
   static uint16_t startPort =
-      config.use_port ? config.use_port : 10000 + rand() % 2000;
+      config.use_port.size() ? config.use_port[0] : 10000 + rand() % 2000;
   bool v6 = config.send_options.ipv6;
-  if (config.use_port) {
+  if (config.use_port.size()) {
     return startPort++;
   }
   for (int i = 0; i < 1000; i++) {
@@ -948,7 +956,7 @@ std::unique_ptr<RunnerBase> prep_io_uring(Config const& cfg, uint16_t port) {
   runner->addListenSock(
       mkServerSock(cfg, port, cfg.send_options.ipv6, flags),
       cfg.send_options.ipv6);
-  log("io_uring test using ", TSock::describeFlags());
+  log("io_uring test on port ", port, " using ", TSock::describeFlags());
   return runner;
 }
 
@@ -1057,9 +1065,12 @@ desc.add_options()
 ("verbose", "verbose logging")
 ("io_uring_supports_nonblock_accept",
  po::value<bool>(&config.io_uring_supports_nonblock_accept))
+("io_uring_register",
+   po::value<bool>(&config.io_uring_register))
 ("ring_size", po::value(&config.ring_size))
 ("recv_size", po::value(&config.recv_size))
-("use_port", po::value(&config.use_port), "what target port")
+("use_port", po::value<std::vector<uint16_t>>(&config.use_port)->multitoken(),
+ "what target port")
 ("server_only", po::value(&config.server_only),
  "do not tx locally, wait for it")
 ("client_only", po::value(&config.client_only),
@@ -1168,15 +1179,17 @@ int main(int argc, char** argv) {
   }
 
   if (cfg.client_only) {
-    if (!cfg.use_port) {
+    if (cfg.use_port.empty()) {
       die("please specify port for client_only");
     }
-    log("using given port ", cfg.use_port, ". not setting up local receivers");
     receiver_factories.clear();
-    receiver_factories.push_back([&cfg]() -> Receiver {
-      return Receiver{
-          std::make_unique<NullRunner>(), cfg.use_port, "given_port"};
-    });
+    log("using given ports not setting up local receivers");
+    for (auto port : cfg.use_port) {
+      receiver_factories.push_back([port]() -> Receiver {
+        return Receiver{
+            std::make_unique<NullRunner>(), port, strcat("given_port_", port)};
+      });
+    }
   }
 
   std::vector<std::string> results;
