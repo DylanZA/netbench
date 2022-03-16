@@ -190,7 +190,7 @@ class RxStats {
     }
   }
 
-  void doneLoop(size_t bytes, size_t packets) {
+  void doneLoop(size_t bytes, size_t requests) {
     using namespace std::chrono;
 
     auto const now = steady_clock::now();
@@ -198,8 +198,8 @@ class RxStats {
 
     if (duration > seconds(1)) {
       uint64_t const millis = duration_cast<milliseconds>(duration).count();
-      double bps = ((bytes - lastBytes) * 1000.9) / millis;
-      double pps = ((packets - lastPackets) * 1000.9) / millis;
+      double bps = ((bytes - lastBytes) * 1000.0) / millis;
+      double rps = ((requests - lastRequests) * 1000.0) / millis;
       uint64_t idle = duration_cast<milliseconds>(totalWaited).count();
 
       char buff[2048];
@@ -207,15 +207,15 @@ class RxStats {
       int written = snprintf(
           buff,
           sizeof(buff),
-          "rx: pps:%6.2fk Bps:%6.2fM idle=%lums",
-          pps / 1000.0,
+          "rx: rps:%6.2fk Bps:%6.2fM idle=%lums",
+          rps / 1000.0,
           bps / 1000000.0,
           idle);
       if (written >= 0) {
         log(std::string_view(buff, written));
       }
       lastBytes = bytes;
-      lastPackets = packets;
+      lastRequests = requests;
       lastStats_ = now;
     }
   }
@@ -227,7 +227,7 @@ class RxStats {
   std::chrono::steady_clock::time_point waitStarted;
   std::chrono::steady_clock::duration totalWaited{0};
   size_t lastBytes = 0;
-  size_t lastPackets = 0;
+  size_t lastRequests = 0;
 };
 
 class RunnerBase {
@@ -239,7 +239,10 @@ class RunnerBase {
  protected:
   void didRead(int x) {
     bytesRx_ += x;
-    packetsRx_++;
+  }
+
+  void finishedRequests(int n) {
+    requestsRx_ += n;
   }
 
   void newSock() {
@@ -260,7 +263,7 @@ class RunnerBase {
     return socks_;
   }
 
-  size_t packetsRx_ = 0;
+  size_t requestsRx_ = 0;
   size_t bytesRx_ = 0;
 
  private:
@@ -612,6 +615,7 @@ struct IOUringRunner : public RunnerBase {
         addBuffer(recycleBufferIdx);
       }
       if (uint32_t sends = sock->peekSend(); sends > 0) {
+        finishedRequests(sends);
         addSend(sock, sends);
       }
       didRead(amount);
@@ -740,7 +744,7 @@ struct IOUringRunner : public RunnerBase {
       }
 
       if (cfg_.print_rx_stats) {
-        rx_stats.doneLoop(bytesRx_, packetsRx_);
+        rx_stats.doneLoop(bytesRx_, requestsRx_);
       }
     }
   }
@@ -918,8 +922,9 @@ struct EPollRunner : public RunnerBase {
         return -1;
       } else {
         didRead(res);
-        ed->to_write += ed->parser.consume(rcvbuff.data(), res);
-        reads++;
+        int consumed = ed->parser.consume(rcvbuff.data(), res);
+        finishedRequests(consumed);
+        ed->to_write += consumed;
       }
     } while (res == (int)rcvbuff.size());
     return 0;
@@ -980,7 +985,7 @@ struct EPollRunner : public RunnerBase {
         }
       }
       if (cfg_.print_rx_stats) {
-        rx_stats.doneLoop(bytesRx_, packetsRx_);
+        rx_stats.doneLoop(bytesRx_, requestsRx_);
       }
     }
 
@@ -993,7 +998,6 @@ struct EPollRunner : public RunnerBase {
   std::vector<char> rcvbuff;
   std::vector<std::unique_ptr<EPollData>> listeners_;
   std::unordered_set<EPollData*> sockets_;
-  size_t reads = 0;
 };
 
 uint16_t pickPort(Config const& config) {
