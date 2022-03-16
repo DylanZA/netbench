@@ -1,6 +1,7 @@
 #include <boost/algorithm/string/join.hpp>
 #include <boost/core/noncopyable.hpp>
 #include <boost/program_options.hpp>
+#include <string_view>
 #include <thread>
 #include <unordered_set>
 
@@ -73,7 +74,9 @@ struct Config {
   bool io_uring_supports_nonblock_accept = false;
   bool io_uring_false_limit_cqes = false;
   bool io_uring_register = true;
+  int io_uring_max_cqe_loop = 128;
 
+  bool print_rx_stats = true;
   std::vector<std::string> tx;
   std::vector<std::string> rx;
 };
@@ -175,6 +178,56 @@ struct ProtocolParser {
   uint32_t so_far = 0;
 };
 
+class RxStats {
+ public:
+  void startWait() {
+    waitStarted = std::chrono::steady_clock::now();
+  }
+
+  void doneWait() {
+    totalWaited += (std::chrono::steady_clock::now() - waitStarted);
+  }
+
+  void doneLoop(size_t bytes, size_t packets) {
+    using namespace std::chrono;
+
+    auto const now = steady_clock::now();
+    auto const duration = now - lastStats_;
+
+    if (duration > seconds(1)) {
+      uint64_t const millis = duration_cast<milliseconds>(duration).count();
+      double bps = ((bytes - lastBytes) * 1000.9) / millis;
+      double pps = ((packets - lastPackets) * 1000.9) / millis;
+      uint64_t idle = duration_cast<milliseconds>(totalWaited).count();
+
+      char buff[2048];
+      // use snprintf as I like the floating point formatting
+      int written = snprintf(
+          buff,
+          sizeof(buff),
+          "rx: pps:%6.2fk Bps:%6.2fM idle=%lums",
+          pps / 1000.0,
+          bps / 1000000.0,
+          idle);
+      if (written >= 0) {
+        log(std::string_view(buff, written));
+      }
+      lastBytes = bytes;
+      lastPackets = packets;
+      lastStats_ = now;
+    }
+  }
+
+ private:
+  std::chrono::steady_clock::time_point lastStats_ =
+      std::chrono::steady_clock::now();
+
+  std::chrono::steady_clock::time_point waitStarted;
+  std::chrono::steady_clock::duration totalWaited;
+  size_t lastBytes = 0;
+  size_t lastPackets = 0;
+};
+
 class RunnerBase {
  public:
   virtual void loop(std::atomic<bool>* should_shutdown) = 0;
@@ -183,7 +236,8 @@ class RunnerBase {
 
  protected:
   void didRead(int x) {
-    // log("didRead: ", x);
+    bytesRx_ += x;
+    packetsRx_++;
   }
 
   void newSock() {
@@ -203,6 +257,9 @@ class RunnerBase {
   int socks() const {
     return socks_;
   }
+
+  size_t packetsRx_ = 0;
+  size_t bytesRx_ = 0;
 
  private:
   int socks_ = 0;
@@ -631,6 +688,7 @@ struct IOUringRunner : public RunnerBase {
   }
 
   void loop(std::atomic<bool>* should_shutdown) override {
+    RxStats rx_stats;
     struct __kernel_timespec timeout;
     timeout.tv_sec = 1;
     timeout.tv_nsec = 0;
@@ -642,9 +700,13 @@ struct IOUringRunner : public RunnerBase {
     while (socks() || !stopping) {
       submit();
 
-      if (!checkedErrno(
-              io_uring_wait_cqe_timeout(&ring, &cqes_[0], &timeout),
-              "wait_cqe_timeout")) {
+      rx_stats.startWait();
+      int wait_res = checkedErrno(
+          io_uring_wait_cqe_timeout(&ring, &cqes_[0], &timeout),
+          "wait_cqe_timeout");
+      rx_stats.doneWait();
+      if (!wait_res) {
+        rx_stats.doneWait();
         processCqe(cqes_[0]);
         io_uring_cqe_seen(&ring, cqes_[0]);
       }
@@ -662,16 +724,22 @@ struct IOUringRunner : public RunnerBase {
       }
 
       int cqe_count;
+      int loop_count = 0;
       do {
         cqe_count = io_uring_peek_batch_cqe(&ring, cqes_.data(), cqes_.size());
         for (int i = 0; i < cqe_count; i++) {
           processCqe(cqes_[i]);
         }
         io_uring_cq_advance(&ring, cqe_count);
-      } while (cqe_count > 0 && !cfg_.io_uring_false_limit_cqes);
+      } while (cqe_count > 0 && ++loop_count < cfg_.io_uring_max_cqe_loop &&
+               !cfg_.io_uring_false_limit_cqes);
 
       if (!cqe_count && stopping) {
         vlog("processed ", cqe_count, " socks()=", socks());
+      }
+
+      if (cfg_.print_rx_stats) {
+        rx_stats.doneLoop(bytesRx_, packetsRx_);
       }
     }
   }
@@ -739,7 +807,7 @@ struct EPollData {
 };
 
 struct EPollRunner : public RunnerBase {
-  explicit EPollRunner(Config const& cfg) {
+  explicit EPollRunner(Config const& cfg) : cfg_(cfg) {
     epoll_fd = checkedErrno(epoll_create(cfg.max_events), "epoll_create");
     rcvbuff.resize(cfg.recv_size);
     events.resize(cfg.max_events);
@@ -886,10 +954,13 @@ struct EPollRunner : public RunnerBase {
   void stop() override {}
 
   void loop(std::atomic<bool>* should_shutdown) override {
+    RxStats rx_stats;
     while (!should_shutdown->load() && !globalShouldShutdown.load()) {
+      rx_stats.startWait();
       int nevents = checkedErrno(
           epoll_wait(epoll_fd, events.data(), events.size(), 1000),
           "epoll_wait");
+      rx_stats.doneWait();
       if (!nevents) {
         vlog("epoll: no events socks()=", socks());
       }
@@ -907,11 +978,15 @@ struct EPollRunner : public RunnerBase {
             break;
         }
       }
+      if (cfg_.print_rx_stats) {
+        rx_stats.doneLoop(bytesRx_, packetsRx_);
+      }
     }
 
     vlog("epollrunner: done socks=", socks());
   }
 
+  Config const cfg_;
   int epoll_fd;
   std::vector<struct epoll_event> events;
   std::vector<char> rcvbuff;
@@ -1069,6 +1144,7 @@ desc.add_options()
    po::value<bool>(&config.io_uring_register))
 ("ring_size", po::value(&config.ring_size))
 ("recv_size", po::value(&config.recv_size))
+("print_rx_stats", po::value(&config.print_rx_stats))
 ("use_port", po::value<std::vector<uint16_t>>(&config.use_port)->multitoken(),
  "what target port")
 ("server_only", po::value(&config.server_only),
@@ -1091,6 +1167,8 @@ desc.add_options()
  "number of provided buffers")
 ("io_uring_files", po::value(&config.io_uring_files),
  "number of registered files for accept_direct")
+("io_uring_max_cqe_loop", po::value(&config.io_uring_max_cqe_loop),
+ "max loops before another syscall to wait for completions")
 ;
   // clang-format on
 
