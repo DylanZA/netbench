@@ -185,7 +185,10 @@ class RxStats {
   }
 
   void doneWait() {
-    totalWaited += (std::chrono::steady_clock::now() - waitStarted);
+    auto now = std::chrono::steady_clock::now();
+    if (now > waitStarted) {
+      totalWaited += (now - waitStarted);
+    }
   }
 
   void doneLoop(size_t bytes, size_t packets) {
@@ -223,7 +226,7 @@ class RxStats {
       std::chrono::steady_clock::now();
 
   std::chrono::steady_clock::time_point waitStarted;
-  std::chrono::steady_clock::duration totalWaited;
+  std::chrono::steady_clock::duration totalWaited{0};
   size_t lastBytes = 0;
   size_t lastPackets = 0;
 };
