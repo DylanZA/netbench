@@ -278,7 +278,8 @@ class Sender {
       }
       ready_barrier.wait();
       end_ = std::chrono::steady_clock::now() +
-          std::chrono::seconds(cfg_.run_seconds);
+          std::chrono::milliseconds(
+                 static_cast<uint64_t>(cfg_.run_seconds * 1000.0));
       state_ = SenderState::Running;
     }
     switch (state_) {

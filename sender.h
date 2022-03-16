@@ -13,7 +13,7 @@ struct SendOptions {
   size_t medium_size = 1200;
   size_t large_size = 64000;
   bool zero_send_buf = true;
-  int run_seconds = 5;
+  float run_seconds = 5;
   int maxOutstanding = 16000;
 
   std::string host;
