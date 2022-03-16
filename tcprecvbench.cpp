@@ -72,7 +72,6 @@ struct Config {
   SendOptions send_options;
 
   bool io_uring_supports_nonblock_accept = false;
-  bool io_uring_false_limit_cqes = false;
   bool io_uring_register = true;
   int io_uring_max_cqe_loop = 128;
 
@@ -734,8 +733,7 @@ struct IOUringRunner : public RunnerBase {
           processCqe(cqes_[i]);
         }
         io_uring_cq_advance(&ring, cqe_count);
-      } while (cqe_count > 0 && ++loop_count < cfg_.io_uring_max_cqe_loop &&
-               !cfg_.io_uring_false_limit_cqes);
+      } while (cqe_count > 0 && ++loop_count < cfg_.io_uring_max_cqe_loop);
 
       if (!cqe_count && stopping) {
         vlog("processed ", cqe_count, " socks()=", socks());
@@ -1103,6 +1101,7 @@ allRx() {
        [](Config const& cfg) -> Receiver {
          auto c2 = cfg;
          c2.max_events = 1;
+         c2.io_uring_max_cqe_loop = 1;
          uint16_t port = pickPort(c2);
          return Receiver{
              prep_io_uring<BasicSock<4096, kLoopRecvFlag>>(c2, port), port};
