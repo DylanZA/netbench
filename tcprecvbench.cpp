@@ -77,6 +77,7 @@ struct IoUringRxConfig : RxConfig {
   int max_cqe_loop = 128;
   int provided_buffer_count = 1024;
   int fixed_file_count = 16000;
+  int provided_buffer_low_watermark = 32;
 
   std::string const toString() const {
     // only give the important options:
@@ -84,7 +85,12 @@ struct IoUringRxConfig : RxConfig {
         "fixed_files=",
         fixed_files ? strcat("1 (count=", fixed_file_count, ")") : strcat("0"),
         " provide_buffers=",
-        provide_buffers ? strcat("1 (count=", provided_buffer_count, ")")
+        provide_buffers ? strcat(
+                              "1 (count=",
+                              provided_buffer_count,
+                              " refill=",
+                              provided_buffer_low_watermark,
+                              ")")
                         : strcat("0"));
   }
 };
@@ -361,11 +367,15 @@ class BufferProvider : private boost::noncopyable {
  public:
   static constexpr int kBgid = 1;
 
-  explicit BufferProvider(size_t count, size_t size) : sizePerBuffer_(size) {
-    buffers_.resize(count);
-    for (size_t i = 0; i < buffers_.size(); i++) {
-      buffers_[i].resize(size);
+  explicit BufferProvider(size_t count, size_t size, int lowWatermark)
+      : sizePerBuffer_(size), lowWatermark_(lowWatermark) {
+    buffer_.resize(count * size);
+    for (size_t i = 0; i < count; i++) {
+      buffers_.push_back(buffer_.data() + i * size);
     }
+    toProvide_.reserve(32);
+    toProvide_.emplace_back(0, count);
+    toProvideCount_ = count;
   }
 
   size_t count() const {
@@ -376,18 +386,102 @@ class BufferProvider : private boost::noncopyable {
     return sizePerBuffer_;
   }
 
-  void add(int i, struct io_uring_sqe* sqe) {
+  size_t toProvideCount() const {
+    return toProvideCount_;
+  }
+
+  bool canProvide() const {
+    return toProvide_.size();
+  }
+
+  bool needsToProvide() const {
+    return toProvideCount_ > lowWatermark_;
+  }
+
+  void returnIndex(int i) {
+    if (toProvide_.empty()) {
+      // log("return ", i, " was empty");
+      toProvide_.emplace_back(i);
+    } else if (toProvide_.back().merge(i)) {
+      // yay, nothing to do
+    } else if (
+        toProvide_.size() >= 2 && toProvide_[toProvide_.size() - 2].merge(i)) {
+      // yay too, try merge these two. this accounts for out of order by 1 index
+      // where we receive 1,3,2. so we merge 2 into 3, and then (2,3) into 1
+      if (toProvide_[toProvide_.size() - 2].merge(toProvide_.back())) {
+        toProvide_.pop_back();
+      }
+    } else {
+      toProvide_.emplace_back(i);
+    }
+    ++toProvideCount_;
+  }
+
+  void provide(struct io_uring_sqe* sqe) {
+    Range const& r = toProvide_.back();
     io_uring_prep_provide_buffers(
-        sqe, buffers_[i].data(), buffers_[i].size(), 1, kBgid, i);
+        sqe, buffers_[r.start], sizePerBuffer_, r.count, kBgid, r.start);
+    // log("recycle ",
+    //     r.start,
+    //     " count=",
+    //     r.count,
+    //     " to=",
+    //     toProvideCount_,
+    //     " size=",
+    //     toProvide_.size());
+    toProvideCount_ -= r.count;
+    toProvide_.pop_back();
+    if (toProvide_.size() == 0) {
+      // URGH
+      if (toProvideCount_ != 0) {
+        log("huh was ", toProvideCount_, " but wanted 0");
+      }
+      toProvideCount_ = 0;
+    }
   }
 
   char const* getData(int i) const {
-    return buffers_.at(i).data();
+    return buffers_.at(i);
   }
 
  private:
   size_t sizePerBuffer_;
-  std::vector<std::vector<char>> buffers_;
+  std::vector<char> buffer_;
+  std::vector<char*> buffers_;
+  struct Range {
+    explicit Range(int idx, int count = 1) : start(idx), count(count) {}
+    int start;
+    int count = 1;
+
+    bool merge(int idx) {
+      if (idx == start - 1) {
+        start = idx;
+        count++;
+        return true;
+      } else if (idx == start + count) {
+        count++;
+        return true;
+      } else {
+        return false;
+      }
+    }
+
+    bool merge(Range const& r) {
+      if (start + count == r.start) {
+        count += r.count;
+        return true;
+      } else if (r.start + r.count == start) {
+        count += r.count;
+        start = r.start;
+        return true;
+      } else {
+        return false;
+      }
+    }
+  };
+  ssize_t toProvideCount_ = 0;
+  int lowWatermark_;
+  std::vector<Range> toProvide_;
 };
 
 static constexpr int kUseBufferProviderFlag = 1;
@@ -524,7 +618,10 @@ struct IOUringRunner : public RunnerBase {
         cfg_(cfg),
         rxCfg_(rx_cfg),
         ring(mkIoUring(rx_cfg)),
-        buffers_(rx_cfg.provided_buffer_count, rx_cfg.recv_size) {
+        buffers_(
+            rx_cfg.provided_buffer_count,
+            rx_cfg.recv_size,
+            rx_cfg.provided_buffer_low_watermark) {
     if (TSock::kUseFixedFiles && TSock::kShouldLoop) {
       die("can't have fixed files and looping, "
           "we don't have the fd to call recv() !");
@@ -533,9 +630,7 @@ struct IOUringRunner : public RunnerBase {
     cqes_.resize(rx_cfg.max_events);
 
     if (TSock::kUseBufferProvider) {
-      for (size_t i = 0; i < buffers_.count(); i++) {
-        addBuffer(i);
-      }
+      provideBuffers(true);
       submit();
     }
 
@@ -559,10 +654,20 @@ struct IOUringRunner : public RunnerBase {
     io_uring_queue_exit(&ring);
   }
 
-  void addBuffer(int i) {
-    auto* sqe = get_sqe();
-    buffers_.add(i, sqe);
-    io_uring_sqe_set_data(sqe, NULL);
+  void provideBuffers(bool force) {
+    if (!TSock::kUseBufferProvider) {
+      return;
+    }
+    if (!(force || buffers_.needsToProvide())) {
+      return;
+    }
+
+    // log("providing ", buffers_.toProvideCount());
+    while (buffers_.canProvide()) {
+      auto* sqe = get_sqe();
+      buffers_.provide(sqe);
+      io_uring_sqe_set_data(sqe, NULL);
+    }
   }
 
   static constexpr int kAccept = 1;
@@ -684,7 +789,8 @@ struct IOUringRunner : public RunnerBase {
     if (amount > 0) {
       int recycleBufferIdx = sock->didRead(amount, buffers_, cqe);
       if (recycleBufferIdx > 0) {
-        addBuffer(recycleBufferIdx);
+        buffers_.returnIndex(recycleBufferIdx);
+        provideBuffers(false);
       }
       if (uint32_t sends = sock->peekSend(); sends > 0) {
         finishedRequests(sends);
@@ -776,6 +882,7 @@ struct IOUringRunner : public RunnerBase {
     }
 
     while (socks() || !stopping) {
+      provideBuffers(false /* maybe we should force? */);
       submit();
 
       rx_stats.startWait();
@@ -1329,6 +1436,8 @@ io_uring_desc.add_options()
      ->default_value(io_uring_cfg.provided_buffer_count))
   ("fixed_file_count", po::value(&io_uring_cfg.fixed_file_count)
      ->default_value(io_uring_cfg.fixed_file_count))
+  ("provided_buffer_low_watermark", po::value(&io_uring_cfg.provided_buffer_low_watermark)
+     ->default_value(io_uring_cfg.provided_buffer_low_watermark))
   ;
   // clang-format on
 
