@@ -192,7 +192,9 @@ class RxStats {
 
   void doneWait() {
     auto now = std::chrono::steady_clock::now();
-    if (now > waitStarted_) {
+    // anything under 100us seems to be very noisy
+    static constexpr std::chrono::microseconds kEpsilon{100};
+    if (now > waitStarted_ + kEpsilon) {
       idle_ += (now - waitStarted_);
     }
   }
