@@ -421,6 +421,7 @@ class BufferProvider : private boost::noncopyable {
     Range const& r = toProvide_.back();
     io_uring_prep_provide_buffers(
         sqe, buffers_[r.start], sizePerBuffer_, r.count, kBgid, r.start);
+    sqe->flags |= IOSQE_CQE_SKIP_SUCCESS;
     // log("recycle ",
     //     r.start,
     //     " count=",
@@ -515,6 +516,7 @@ struct BasicSock {
     if (kUseFixedFiles) {
       sqe->flags |= IOSQE_FIXED_FILE;
     }
+    sqe->flags |= IOSQE_CQE_SKIP_SUCCESS;
     do_send -= std::min(len, do_send);
   }
 
