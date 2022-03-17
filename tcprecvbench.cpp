@@ -1407,7 +1407,7 @@ int main(int argc, char** argv) {
       for (auto const& r : receiver_factories) {
         Receiver rcv = r();
         std::atomic<bool> should_shutdown{false};
-        log("running ", tx, " for ", rcv.name);
+        log("running ", tx, " for ", rcv.name, " cfg=", rcv.rxCfg);
 
         std::thread rcv_thread(wrapThread(
             strcat("rcv", rcv.name),
@@ -1421,7 +1421,9 @@ int main(int argc, char** argv) {
         rcv_thread.join();
         log("...done receiver");
         results.push_back(strcat(
-            leftpad(strcat(tx, "_", rcv.name), 30), ": ", res.toString()));
+            leftpad(strcat(tx, "_", rcv.name, "_", rcv.rxCfg), 40),
+            ": ",
+            res.toString()));
       }
     }
     for (auto const& r : results) {
