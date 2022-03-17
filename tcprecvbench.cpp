@@ -14,6 +14,7 @@
 #include <stdlib.h>
 #include <sys/epoll.h>
 #include <sys/socket.h>
+#include <sys/times.h>
 
 #include "sender.h"
 #include "util.h"
@@ -179,56 +180,90 @@ struct ProtocolParser {
 
 class RxStats {
  public:
+  RxStats() {
+    auto const now = std::chrono::steady_clock::now();
+    started_ = lastStats_ = now;
+    lastClock_ = checkedErrno(times(&lastTimes_), "initial times");
+  }
+
   void startWait() {
-    waitStarted = std::chrono::steady_clock::now();
+    waitStarted_ = std::chrono::steady_clock::now();
   }
 
   void doneWait() {
     auto now = std::chrono::steady_clock::now();
-    if (now > waitStarted) {
-      totalWaited += (now - waitStarted);
+    if (now > waitStarted_) {
+      idle_ += (now - waitStarted_);
     }
   }
 
   void doneLoop(size_t bytes, size_t requests) {
-    using namespace std::chrono;
-
-    auto const now = steady_clock::now();
+    auto const now = std::chrono::steady_clock::now();
     auto const duration = now - lastStats_;
+    ++loops_;
 
-    if (duration > seconds(1)) {
-      uint64_t const millis = duration_cast<milliseconds>(duration).count();
-      double bps = ((bytes - lastBytes) * 1000.0) / millis;
-      double rps = ((requests - lastRequests) * 1000.0) / millis;
-      uint64_t idle = duration_cast<milliseconds>(totalWaited).count();
+    if (duration >= std::chrono::seconds(1)) {
+      doLog(bytes, requests, now, duration);
+    }
+  }
 
+ private:
+  std::chrono::milliseconds getMs(clock_t from, clock_t to) {
+    return std::chrono::milliseconds(
+        to <= from ? 0llu : (((to - from) * 1000llu) / ticksPerSecond_));
+  }
+
+  void doLog(
+      size_t bytes,
+      size_t requests,
+      std::chrono::steady_clock::time_point now,
+      std::chrono::steady_clock::duration duration) {
+    using namespace std::chrono;
+    uint64_t const millis = duration_cast<milliseconds>(duration).count();
+    double bps = ((bytes - lastBytes_) * 1000.0) / millis;
+    double rps = ((requests - lastRequests_) * 1000.0) / millis;
+    struct tms times_now {};
+    clock_t clock_now = checkedErrno(::times(&times_now), "loop times");
+
+    if (requests > lastRequests_) {
       char buff[2048];
-      if (!rps && !lastRps) {
-	lastStats_ = now;
+      if (!rps && !lastRps_) {
+        lastStats_ = now;
         return;
       }
       // use snprintf as I like the floating point formatting
       int written = snprintf(
           buff,
           sizeof(buff),
-          "rx (port=%d): rps:%6.2fk Bps:%6.2fM idle=%lums",
+          "rx (port=%d): rps:%6.2fk Bps:%6.2fM idle=%lums "
+          "user=%lums system=%lums wall=%lums loops=%lu",
           port,
           rps / 1000.0,
           bps / 1000000.0,
-          idle);
+          duration_cast<milliseconds>(idle_).count(),
+          getMs(lastTimes_.tms_utime, times_now.tms_utime).count(),
+          getMs(lastTimes_.tms_stime, times_now.tms_stime).count(),
+          getMs(lastClock_, clock_now).count(),
+          loops_);
       if (written >= 0) {
         log(std::string_view(buff, written));
       }
-      lastBytes = bytes;
-      lastRequests = requests;
-      lastRps = rps;
-      lastStats_ = now;
     }
+    loops_ = 0;
+    idle_ = steady_clock::duration{0};
+    lastClock_ = clock_now;
+    lastTimes_ = times_now;
+    lastBytes_ = bytes;
+    lastRequests_ = requests;
+    lastStats_ = now;
+    lastRps_ = rps;
   }
 
  uint16_t port;
 
  private:
+  std::chrono::steady_clock::time_point started_ =
+      std::chrono::steady_clock::now();
   std::chrono::steady_clock::time_point lastStats_ =
       std::chrono::steady_clock::now();
 
@@ -236,7 +271,16 @@ class RxStats {
   std::chrono::steady_clock::duration totalWaited{0};
   size_t lastBytes = 0;
   size_t lastRequests = 0;
-  size_t lastRps = 0;
+  uint64_t ticksPerSecond_ = sysconf(_SC_CLK_TCK);
+  struct tms lastTimes_;
+  clock_t lastClock_;
+  uint64_t loops_ = 0;
+
+  std::chrono::steady_clock::time_point waitStarted_;
+  std::chrono::steady_clock::duration idle_{0};
+  size_t lastBytes_ = 0;
+  size_t lastRequests_ = 0;
+  size_t lastRps_ = 0;
 };
 
 class RunnerBase {
