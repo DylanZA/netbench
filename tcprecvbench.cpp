@@ -78,6 +78,7 @@ struct IoUringRxConfig : RxConfig {
   int provided_buffer_count = 1024;
   int fixed_file_count = 16000;
   int provided_buffer_low_watermark = 32;
+  int provided_buffer_compact = 0;
 
   std::string const toString() const {
     // only give the important options:
@@ -90,6 +91,8 @@ struct IoUringRxConfig : RxConfig {
                               provided_buffer_count,
                               " refill=",
                               provided_buffer_low_watermark,
+                              " compact=",
+                              provided_buffer_compact,
                               ")")
                         : strcat("0"));
   }
@@ -254,7 +257,7 @@ class RxStats {
     struct tms times_now {};
     clock_t clock_now = checkedErrno(::times(&times_now), "loop times");
 
-    if (requests > lastRequests_ || lastRps_) {
+    if (requests > lastRequests_ && lastRps_) {
       char buff[2048];
       // use snprintf as I like the floating point formatting
       int written = snprintf(
@@ -373,7 +376,8 @@ class BufferProvider : private boost::noncopyable {
     for (size_t i = 0; i < count; i++) {
       buffers_.push_back(buffer_.data() + i * size);
     }
-    toProvide_.reserve(32);
+    toProvide_.reserve(128);
+    toProvide2_.reserve(128);
     toProvide_.emplace_back(0, count);
     toProvideCount_ = count;
   }
@@ -396,6 +400,34 @@ class BufferProvider : private boost::noncopyable {
 
   bool needsToProvide() const {
     return toProvideCount_ > lowWatermark_;
+  }
+
+  void compact() {
+    if (toProvide_.size() <= 1) {
+      return;
+    }
+    std::sort(
+        toProvide_.begin(), toProvide_.end(), [](auto const& a, auto const& b) {
+          return a.start < b.start;
+        });
+    int merged = 0;
+    toProvide2_.clear();
+    toProvide2_.push_back(toProvide_[0]);
+    for (size_t i = 1; i < toProvide_.size(); i++) {
+      auto const& p = toProvide_[i];
+      if (!toProvide2_.back().merge(p)) {
+        toProvide2_.push_back(p);
+      } else {
+        ++merged;
+      }
+    }
+    toProvide_.swap(toProvide2_);
+    // log("merged ",
+    //     merged,
+    //     " was ",
+    //     toProvide2_.size(),
+    //     " now ",
+    //     toProvide_.size());
   }
 
   void returnIndex(int i) {
@@ -483,6 +515,7 @@ class BufferProvider : private boost::noncopyable {
   ssize_t toProvideCount_ = 0;
   int lowWatermark_;
   std::vector<Range> toProvide_;
+  std::vector<Range> toProvide2_;
 };
 
 static constexpr int kUseBufferProviderFlag = 1;
@@ -664,7 +697,9 @@ struct IOUringRunner : public RunnerBase {
       return;
     }
 
-    // log("providing ", buffers_.toProvideCount());
+    if (rxCfg_.provided_buffer_compact) {
+      buffers_.compact();
+    }
     while (buffers_.canProvide()) {
       auto* sqe = get_sqe();
       buffers_.provide(sqe);
@@ -1440,6 +1475,8 @@ io_uring_desc.add_options()
      ->default_value(io_uring_cfg.fixed_file_count))
   ("provided_buffer_low_watermark", po::value(&io_uring_cfg.provided_buffer_low_watermark)
      ->default_value(io_uring_cfg.provided_buffer_low_watermark))
+  ("provided_buffer_compact", po::value(&io_uring_cfg.provided_buffer_compact)
+     ->default_value(io_uring_cfg.provided_buffer_compact))
   ;
   // clang-format on
 
