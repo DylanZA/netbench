@@ -203,6 +203,10 @@ class RxStats {
       uint64_t idle = duration_cast<milliseconds>(totalWaited).count();
 
       char buff[2048];
+      if (!rps && !lastRps) {
+	lastStats_ = now;
+        return;
+      }
       // use snprintf as I like the floating point formatting
       int written = snprintf(
           buff,
@@ -216,6 +220,7 @@ class RxStats {
       }
       lastBytes = bytes;
       lastRequests = requests;
+      lastRps = rps;
       lastStats_ = now;
     }
   }
@@ -228,6 +233,7 @@ class RxStats {
   std::chrono::steady_clock::duration totalWaited{0};
   size_t lastBytes = 0;
   size_t lastRequests = 0;
+  size_t lastRps = 0;
 };
 
 class RunnerBase {
