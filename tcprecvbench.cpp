@@ -77,6 +77,16 @@ struct IoUringRxConfig : RxConfig {
   int max_cqe_loop = 128;
   int provided_buffer_count = 1024;
   int fixed_file_count = 16000;
+
+  std::string const toString() const {
+    // only give the important options:
+    return strcat(
+        "fixed_files=",
+        fixed_files ? strcat("1 (count=", fixed_file_count, ")") : strcat("0"),
+        " provide_buffers=",
+        provide_buffers ? strcat("1 (count=", provided_buffer_count, ")")
+                        : strcat("0"));
+  }
 };
 
 struct EpollRxConfig : RxConfig {};
@@ -438,18 +448,6 @@ struct BasicSock {
     io_uring_prep_close(sqe, fd);
     sqe->flags |= IOSQE_FIXED_FILE;
     io_uring_sqe_set_data(sqe, 0);
-  }
-
-  static std::string describeFlags() {
-    return strcat(
-        "readsize=",
-        ReadSize,
-        " loop=",
-        kShouldLoop,
-        " provider=",
-        kUseBufferProvider,
-        " fixedFiles=",
-        kUseFixedFiles);
   }
 
   int didRead(size_t size, BufferProvider& provider, struct io_uring_cqe* cqe) {
@@ -1127,7 +1125,7 @@ struct Receiver {
   std::unique_ptr<RunnerBase> r;
   uint16_t port;
   std::string name;
-  std::string options;
+  std::string rxCfg;
 };
 
 Receiver makeEpollRx(Config const& cfg, EpollRxConfig const& rx_cfg) {
@@ -1162,7 +1160,6 @@ Receiver makeIoUringRx(Config const& cfg, IoUringRxConfig const& rx_cfg) {
   case x:                                                               \
     runner = std::make_unique<IOUringRunner<BasicSockPicker<x>::Sock>>( \
         cfg, rx_cfg, strcat("io_uring port=", port));                   \
-    descFlags = BasicSockPicker<x>::Sock::describeFlags();              \
     break;
 
   switch (flags) {
@@ -1186,7 +1183,7 @@ Receiver makeIoUringRx(Config const& cfg, IoUringRxConfig const& rx_cfg) {
       mkServerSock(rx_cfg, port, cfg.send_options.ipv6, sock_flags),
       cfg.send_options.ipv6);
 
-  return Receiver{std::move(runner), port, "io_uring", descFlags};
+  return Receiver{std::move(runner), port, "io_uring", rx_cfg.toString()};
 }
 
 Config parse(int argc, char** argv) {
@@ -1444,7 +1441,7 @@ int main(int argc, char** argv) {
     }
     log("using receivers: ");
     for (auto const& r : receivers) {
-      log(r.name, ": port=", r.port);
+      log(r.name, " port=", r.port, " rx_cfg=", r.rxCfg);
     }
 
     for (auto& r : receivers) {
