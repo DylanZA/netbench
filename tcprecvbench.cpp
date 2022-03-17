@@ -1140,11 +1140,7 @@ Receiver makeEpollRx(Config const& cfg, EpollRxConfig const& rx_cfg) {
 
 template <size_t flags>
 struct BasicSockPicker {
-  // if constexpr (flags & kUseBufferProviderFlag) {
-  using Sock = BasicSock<64, flags>;
-  // } else {
-  //   using Sock = BasicSock<4096, flags>;
-  // }
+  using Sock = BasicSock<4096, flags>;
 };
 
 Receiver makeIoUringRx(Config const& cfg, IoUringRxConfig const& rx_cfg) {
