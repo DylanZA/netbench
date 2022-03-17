@@ -211,7 +211,8 @@ class RxStats {
       int written = snprintf(
           buff,
           sizeof(buff),
-          "rx: rps:%6.2fk Bps:%6.2fM idle=%lums",
+          "rx (port=%d): rps:%6.2fk Bps:%6.2fM idle=%lums",
+          port,
           rps / 1000.0,
           bps / 1000000.0,
           idle);
@@ -224,6 +225,8 @@ class RxStats {
       lastStats_ = now;
     }
   }
+
+ uint16_t port;
 
  private:
   std::chrono::steady_clock::time_point lastStats_ =
@@ -709,6 +712,7 @@ struct IOUringRunner : public RunnerBase {
       io_uring_register_ring_fd(&ring);
     }
 
+    rx_stats.port = port;
     while (socks() || !stopping) {
       submit();
 
@@ -803,6 +807,7 @@ struct IOUringRunner : public RunnerBase {
   int listeners_ = 0;
   uint32_t enobuffCount_ = 0;
   int nextFdIdx_ = 0;
+  int port;
 };
 
 static constexpr uint32_t kSocket = 0;
@@ -1000,6 +1005,7 @@ struct EPollRunner : public RunnerBase {
 
   Config const cfg_;
   int epoll_fd;
+  int port;
   std::vector<struct epoll_event> events;
   std::vector<char> rcvbuff;
   std::vector<std::unique_ptr<EPollData>> listeners_;
@@ -1043,6 +1049,7 @@ std::unique_ptr<RunnerBase> prep_io_uring(Config const& cfg, uint16_t port) {
       mkServerSock(cfg, port, cfg.send_options.ipv6, flags),
       cfg.send_options.ipv6);
   log("io_uring test on port ", port, " using ", TSock::describeFlags());
+  runner->port = port;
   return runner;
 }
 
@@ -1051,6 +1058,7 @@ std::unique_ptr<RunnerBase> prep_epoll(Config const& cfg, uint16_t port) {
   runner->addListenSock(
       mkServerSock(cfg, port, cfg.send_options.ipv6, SOCK_NONBLOCK),
       cfg.send_options.ipv6);
+  runner->port = port;
   return runner;
 }
 
