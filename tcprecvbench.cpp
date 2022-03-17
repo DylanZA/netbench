@@ -1251,8 +1251,8 @@ struct BasicSockPicker {
   // except for to do sending
   using Sock = std::conditional_t<
       flags & kUseBufferProviderFlag,
-      BasicSock<4096, flags>,
-      BasicSock<64, flags>>;
+      BasicSock<64, flags>,
+      BasicSock<4096, flags>>;
 };
 
 Receiver makeIoUringRx(Config const& cfg, IoUringRxConfig const& rx_cfg) {
