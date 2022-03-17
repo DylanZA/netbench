@@ -60,21 +60,32 @@ void intHandler(int dummy) {
   globalShouldShutdown = true;
 }
 
-struct Config {
+enum class RxEngine { IoUring, Epoll };
+struct RxConfig {
   int backlog = 100000;
   int max_events = 32;
-  int ring_size = 64;
   int recv_size = 4096;
-  int io_uring_buffers = 1024;
-  int io_uring_files = 16000;
+};
+
+struct IoUringRxConfig : RxConfig {
+  bool supports_nonblock_accept = false;
+  bool register_ring = true;
+  bool provide_buffers = true;
+  bool fixed_files = true;
+  bool loop_recv = false;
+  int sqe_count = 64;
+  int max_cqe_loop = 128;
+  int provided_buffer_count = 1024;
+  int fixed_file_count = 16000;
+};
+
+struct EpollRxConfig : RxConfig {};
+
+struct Config {
   std::vector<uint16_t> use_port;
   bool client_only = false;
   bool server_only = false;
   SendOptions send_options;
-
-  bool io_uring_supports_nonblock_accept = false;
-  bool io_uring_register = true;
-  int io_uring_max_cqe_loop = 128;
 
   bool print_rx_stats = true;
   std::vector<std::string> tx;
@@ -119,25 +130,25 @@ int mkBasicSock(uint16_t port, bool const isv6, int extra_flags = 0) {
 }
 
 int mkServerSock(
-    Config const& cfg,
+    RxConfig const& rx_cfg,
     uint16_t port,
     bool const isv6,
     int extra_flags) {
   int fd = checkedErrno(mkBasicSock(port, isv6, extra_flags));
-  checkedErrno(listen(fd, cfg.backlog), "listen");
+  checkedErrno(listen(fd, rx_cfg.backlog), "listen");
   vlog("made sock ", fd, " v6=", isv6, " port=", port);
   return fd;
 }
 
-struct io_uring mkIoUring(Config const& cfg) {
+struct io_uring mkIoUring(IoUringRxConfig const& rx_cfg) {
   struct io_uring_params params;
   struct io_uring ring;
   memset(&params, 0, sizeof(params));
 
   checkedErrno(
-      io_uring_queue_init_params(cfg.ring_size, &ring, &params),
+      io_uring_queue_init_params(rx_cfg.sqe_count, &ring, &params),
       "io_uring_queue_init_params");
-  if (cfg.io_uring_register) {
+  if (rx_cfg.register_ring) {
     io_uring_register_ring_fd(&ring);
   }
   return ring;
@@ -288,6 +299,7 @@ class RunnerBase {
   }
   virtual void loop(std::atomic<bool>* should_shutdown) = 0;
   virtual void stop() = 0;
+  virtual void addListenSock(int fd, bool v6) = 0;
   virtual ~RunnerBase() = default;
 
  protected:
@@ -330,6 +342,9 @@ class NullRunner : public RunnerBase {
   explicit NullRunner(std::string const& name) : RunnerBase(name) {}
   void loop(std::atomic<bool>*) override {}
   void stop() override {}
+  void addListenSock(int fd, bool) {
+    close(fd);
+  }
 };
 
 class BufferProvider : private boost::noncopyable {
@@ -374,12 +389,7 @@ struct BasicSock {
   static constexpr bool kUseBufferProvider = Flags & kUseBufferProviderFlag;
   static constexpr bool kUseFixedFiles = Flags & kUseFixedFilesFlag;
   static constexpr bool kShouldLoop = Flags & kLoopRecvFlag;
-  explicit BasicSock(int fd) : fd(fd) {
-    static_assert(
-        !(kUseFixedFiles && kShouldLoop),
-        "can't have fixed files and looping, "
-        "we don't have the fd to call recv() !");
-  }
+  explicit BasicSock(int fd) : fd(fd) {}
 
   ~BasicSock() {
     if (!closed_) {
@@ -508,12 +518,21 @@ struct ListenSock : private boost::noncopyable {
 
 template <class TSock>
 struct IOUringRunner : public RunnerBase {
-  explicit IOUringRunner(Config const& cfg, std::string const& name)
+  explicit IOUringRunner(
+      Config const& cfg,
+      IoUringRxConfig const& rx_cfg,
+      std::string const& name)
       : RunnerBase(name),
         cfg_(cfg),
-        ring(mkIoUring(cfg)),
-        buffers_(cfg.io_uring_buffers, cfg.recv_size) {
-    cqes_.resize(cfg.max_events);
+        rxCfg_(rx_cfg),
+        ring(mkIoUring(rx_cfg)),
+        buffers_(rx_cfg.provided_buffer_count, rx_cfg.recv_size) {
+    if (TSock::kUseFixedFiles && TSock::kShouldLoop) {
+      die("can't have fixed files and looping, "
+          "we don't have the fd to call recv() !");
+    }
+
+    cqes_.resize(rx_cfg.max_events);
 
     if (TSock::kUseBufferProvider) {
       for (size_t i = 0; i < buffers_.count(); i++) {
@@ -523,7 +542,7 @@ struct IOUringRunner : public RunnerBase {
     }
 
     if (TSock::kUseFixedFiles) {
-      std::vector<int> files(cfg.io_uring_files, -1);
+      std::vector<int> files(rx_cfg.fixed_file_count, -1);
       checkedErrno(
           io_uring_register_files(&ring, files.data(), files.size()),
           "io_uring_register_files");
@@ -553,12 +572,10 @@ struct IOUringRunner : public RunnerBase {
   static constexpr int kWrite = 3;
   static constexpr int kIgnore = 0;
 
-  void addListenSock(int fd, bool v6, int concurrent_count = 1) {
+  void addListenSock(int fd, bool v6) override {
     listeners_++;
     listenSocks_.push_back(std::make_unique<ListenSock>(fd, v6));
-    for (int i = 0; i < concurrent_count; i++) {
-      addAccept(listenSocks_.back().get());
-    }
+    addAccept(listenSocks_.back().get());
   }
 
   void addAccept(ListenSock* ls) {
@@ -640,7 +657,7 @@ struct IOUringRunner : public RunnerBase {
     if (stopping) {
       return;
     } else {
-      if (cfg_.io_uring_supports_nonblock_accept && !TSock::kUseFixedFiles) {
+      if (rxCfg_.supports_nonblock_accept && !TSock::kUseFixedFiles) {
         // get any outstanding sockets
         struct sockaddr_in addr;
         struct sockaddr_in6 addr6;
@@ -756,7 +773,7 @@ struct IOUringRunner : public RunnerBase {
     timeout.tv_sec = 1;
     timeout.tv_nsec = 0;
 
-    if (cfg_.io_uring_register) {
+    if (rxCfg_.register_ring) {
       io_uring_register_ring_fd(&ring);
     }
 
@@ -794,7 +811,7 @@ struct IOUringRunner : public RunnerBase {
           processCqe(cqes_[i]);
         }
         io_uring_cq_advance(&ring, cqe_count);
-      } while (cqe_count > 0 && ++loop_count < cfg_.io_uring_max_cqe_loop);
+      } while (cqe_count > 0 && ++loop_count < rxCfg_.max_cqe_loop);
 
       if (!cqe_count && stopping) {
         vlog("processed ", cqe_count, " socks()=", socks());
@@ -815,7 +832,7 @@ struct IOUringRunner : public RunnerBase {
 
   int nextFdIdx() {
     int ret = nextFdIdx_++;
-    if (ret >= cfg_.io_uring_files) {
+    if (ret >= rxCfg_.fixed_file_count) {
       die("too many files, limit is ", ret);
     }
     return ret;
@@ -845,6 +862,7 @@ struct IOUringRunner : public RunnerBase {
   }
 
   Config cfg_;
+  IoUringRxConfig rxCfg_;
   int expected = 0;
   bool stopping = false;
   struct io_uring ring;
@@ -854,7 +872,6 @@ struct IOUringRunner : public RunnerBase {
   int listeners_ = 0;
   uint32_t enobuffCount_ = 0;
   int nextFdIdx_ = 0;
-  int port;
 };
 
 static constexpr uint32_t kSocket = 0;
@@ -870,11 +887,14 @@ struct EPollData {
 };
 
 struct EPollRunner : public RunnerBase {
-  explicit EPollRunner(Config const& cfg, std::string const& name)
-      : RunnerBase(name), cfg_(cfg) {
-    epoll_fd = checkedErrno(epoll_create(cfg.max_events), "epoll_create");
-    rcvbuff.resize(cfg.recv_size);
-    events.resize(cfg.max_events);
+  explicit EPollRunner(
+      Config const& cfg,
+      EpollRxConfig const& rx_cfg,
+      std::string const& name)
+      : RunnerBase(name), cfg_(cfg), rxCfg_(rx_cfg) {
+    epoll_fd = checkedErrno(epoll_create(rx_cfg.max_events), "epoll_create");
+    rcvbuff.resize(rx_cfg.recv_size);
+    events.resize(rx_cfg.max_events);
   }
 
   ~EPollRunner() {
@@ -889,7 +909,7 @@ struct EPollRunner : public RunnerBase {
     vlog("EPollRunner cleaned up");
   }
 
-  void addListenSock(int fd, bool v6) {
+  void addListenSock(int fd, bool v6) override {
     struct epoll_event ev;
     memset(&ev, 0, sizeof(ev));
 
@@ -1052,8 +1072,8 @@ struct EPollRunner : public RunnerBase {
   }
 
   Config const cfg_;
+  EpollRxConfig const rxCfg_;
   int epoll_fd;
-  int port;
   std::vector<struct epoll_event> events;
   std::vector<char> rcvbuff;
   std::vector<std::unique_ptr<EPollData>> listeners_;
@@ -1088,29 +1108,6 @@ uint16_t pickPort(Config const& config) {
   return 0;
 }
 
-template <class TSock = BasicSock<>>
-std::unique_ptr<RunnerBase> prep_io_uring(Config const& cfg, uint16_t port) {
-  auto runner =
-      std::make_unique<IOUringRunner<TSock>>(cfg, strcat("io_uring port=", port));
-  // io_uring doesnt seem to like accepting on a nonblocking socket
-  int flags = cfg.io_uring_supports_nonblock_accept ? SOCK_NONBLOCK : 0;
-  runner->addListenSock(
-      mkServerSock(cfg, port, cfg.send_options.ipv6, flags),
-      cfg.send_options.ipv6);
-  log("io_uring test on port ", port, " using ", TSock::describeFlags());
-  runner->port = port;
-  return runner;
-}
-
-std::unique_ptr<RunnerBase> prep_epoll(Config const& cfg, uint16_t port) {
-  auto runner = std::make_unique<EPollRunner>(cfg, strcat("epoll port=", port));
-  runner->addListenSock(
-      mkServerSock(cfg, port, cfg.send_options.ipv6, SOCK_NONBLOCK),
-      cfg.send_options.ipv6);
-  runner->port = port;
-  return runner;
-}
-
 void run(std::unique_ptr<RunnerBase> runner, std::atomic<bool>* shutdown) {
   try {
     runner->loop(shutdown);
@@ -1130,74 +1127,66 @@ struct Receiver {
   std::unique_ptr<RunnerBase> r;
   uint16_t port;
   std::string name;
+  std::string options;
 };
 
-std::unordered_map<std::string, std::function<Receiver(Config const& cfg)>>
-allRx() {
-  return {
-      {"epoll",
-       [](Config const& cfg) -> Receiver {
-         uint16_t port = pickPort(cfg);
-         return Receiver{prep_epoll(cfg, port), port};
-       }},
-      {"epoll_d1",
-       [](Config const& cfg) -> Receiver {
-         auto c2 = cfg;
-         c2.max_events = 1;
-         uint16_t port = pickPort(c2);
-         return Receiver{prep_epoll(c2, port), port};
-       }},
+Receiver makeEpollRx(Config const& cfg, EpollRxConfig const& rx_cfg) {
+  uint16_t port = pickPort(cfg);
+  auto runner =
+      std::make_unique<EPollRunner>(cfg, rx_cfg, strcat("epoll port=", port));
+  runner->addListenSock(
+      mkServerSock(rx_cfg, port, cfg.send_options.ipv6, SOCK_NONBLOCK),
+      cfg.send_options.ipv6);
+  return Receiver{std::move(runner), port, "epoll", ""};
+}
 
-      {"io_uring",
-       [](Config const& cfg) -> Receiver {
-         uint16_t port = pickPort(cfg);
-         return Receiver{
-             prep_io_uring<
-                 BasicSock<4096, kUseFixedFilesFlag | kUseBufferProviderFlag>>(
-                 cfg, port),
-             port};
-       }},
-      {"io_uring_fixed_files",
-       [](Config const& cfg) -> Receiver {
-         uint16_t port = pickPort(cfg);
-         return Receiver{
-             prep_io_uring<BasicSock<4096, kUseFixedFilesFlag>>(cfg, port),
-             port};
-       }},
-      {"io_uring_d1",
-       [](Config const& cfg) -> Receiver {
-         auto c2 = cfg;
-         c2.max_events = 1;
-         c2.io_uring_max_cqe_loop = 1;
-         uint16_t port = pickPort(c2);
-         return Receiver{
-             prep_io_uring<BasicSock<4096, kLoopRecvFlag>>(c2, port), port};
-       }},
-      {"io_uring_provided_buff",
-       [](Config const& cfg) -> Receiver {
-         uint16_t port = pickPort(cfg);
-         return Receiver{
-             prep_io_uring<BasicSock<4096, kUseBufferProviderFlag>>(cfg, port),
-             port};
-       }},
-      {"io_uring_no_loop_recv",
-       [](Config const& cfg) -> Receiver {
-         uint16_t port = pickPort(cfg);
-         return Receiver{prep_io_uring<BasicSock<4096, 0>>(cfg, port), port};
-       }},
-      {"io_uring_loop_recv",
-       [](Config const& cfg) -> Receiver {
-         uint16_t port = pickPort(cfg);
-         return Receiver{
-             prep_io_uring<BasicSock<4096, kLoopRecvFlag>>(cfg, port), port};
-       }},
-      {"io_uring_big_buff",
-       [](Config const& cfg) -> Receiver {
-         uint16_t port = pickPort(cfg);
-         return Receiver{prep_io_uring<BasicSock<64000>>(cfg, port), port};
-       }},
+template <size_t flags>
+struct BasicSockPicker {
+  // if constexpr (flags & kUseBufferProviderFlag) {
+  using Sock = BasicSock<64, flags>;
+  // } else {
+  //   using Sock = BasicSock<4096, flags>;
+  // }
+};
 
+Receiver makeIoUringRx(Config const& cfg, IoUringRxConfig const& rx_cfg) {
+  uint16_t port = pickPort(cfg);
+
+  std::unique_ptr<RunnerBase> runner;
+  size_t flags = (rx_cfg.provide_buffers ? kUseBufferProviderFlag : 0) |
+      (rx_cfg.fixed_files ? kUseFixedFilesFlag : 0) |
+      (rx_cfg.loop_recv ? kLoopRecvFlag : 0);
+
+  std::string descFlags;
+#define DO_FLAG(x)                                                      \
+  case x:                                                               \
+    runner = std::make_unique<IOUringRunner<BasicSockPicker<x>::Sock>>( \
+        cfg, rx_cfg, strcat("io_uring port=", port));                   \
+    descFlags = BasicSockPicker<x>::Sock::describeFlags();              \
+    break;
+
+  switch (flags) {
+    // bit bizarre c++ here, want one line for each possible flags combo
+    DO_FLAG(0)
+    DO_FLAG(1)
+    DO_FLAG(2)
+    DO_FLAG(3)
+    DO_FLAG(4)
+    DO_FLAG(5)
+    DO_FLAG(6)
+    DO_FLAG(7)
+    DO_FLAG(8)
   };
+#undef DO_FLAG
+
+  // io_uring doesnt seem to like accepting on a nonblocking socket
+  int sock_flags = rx_cfg.supports_nonblock_accept ? SOCK_NONBLOCK : 0;
+
+  runner->addListenSock(
+      mkServerSock(rx_cfg, port, cfg.send_options.ipv6, sock_flags),
+      cfg.send_options.ipv6);
+
+  return Receiver{std::move(runner), port, "io_uring", descFlags};
 }
 
 Config parse(int argc, char** argv) {
@@ -1207,12 +1196,6 @@ Config parse(int argc, char** argv) {
 desc.add_options()
 ("help", "produce help message")
 ("verbose", "verbose logging")
-("io_uring_supports_nonblock_accept",
- po::value<bool>(&config.io_uring_supports_nonblock_accept))
-("io_uring_register",
-   po::value<bool>(&config.io_uring_register))
-("ring_size", po::value(&config.ring_size))
-("recv_size", po::value(&config.recv_size))
 ("print_rx_stats", po::value(&config.print_rx_stats))
 ("use_port", po::value<std::vector<uint16_t>>(&config.use_port)->multitoken(),
  "what target port")
@@ -1232,12 +1215,6 @@ desc.add_options()
 ("send_small_size", po::value(&config.send_options.small_size))
 ("send_medium_size", po::value(&config.send_options.medium_size))
 ("send_large_size", po::value(&config.send_options.large_size))
-("io_uring_buffers", po::value(&config.io_uring_buffers),
- "number of provided buffers")
-("io_uring_files", po::value(&config.io_uring_files),
- "number of registered files for accept_direct")
-("io_uring_max_cqe_loop", po::value(&config.io_uring_max_cqe_loop),
- "max loops before another syscall to wait for completions")
 ;
   // clang-format on
 
@@ -1250,10 +1227,7 @@ desc.add_options()
     for (auto tx : allScenarios()) {
       std::cerr << "    " << tx << "\n";
     }
-    std::cerr << "rx options are:\n";
-    for (auto rx : allRx()) {
-      std::cerr << "    " << rx.first << "\n";
-    }
+    std::cerr << "rx engines are: epoll, io_uring\n";
     exit(1);
   }
   if (vm.count("verbose")) {
@@ -1301,28 +1275,115 @@ desc.add_options()
   return config;
 }
 
+std::pair<RxEngine, std::vector<std::string>> getRxEngine(
+    std::string const& parse) {
+  auto split = po::split_unix(parse);
+  if (split.size() < 1) {
+    die("no engine in ", parse);
+  }
+  auto e = split[0];
+  // don't erase the first one, boost skips it expecting an executable
+  if (e == "epoll") {
+    return std::make_pair(RxEngine::Epoll, split);
+  } else if (e == "io_uring") {
+    return std::make_pair(RxEngine::IoUring, split);
+  } else {
+    die("bad rx engine ", e);
+  }
+  throw std::logic_error("should not get here");
+}
+
+std::function<Receiver(Config const&)> parseRx(std::string const& parse) {
+  IoUringRxConfig io_uring_cfg;
+  EpollRxConfig epoll_cfg;
+  po::options_description epoll_desc;
+  po::options_description io_uring_desc;
+
+  // clang-format off
+auto add_base = [&](po::options_description& d, RxConfig& cfg) {
+  d.add_options()
+("help", "produce help message")
+("backlog", po::value(&cfg.backlog)->default_value(cfg.backlog))
+("max_events", po::value(&cfg.max_events)->default_value(cfg.max_events))
+("recv_size", po::value(&cfg.recv_size)->default_value(cfg.recv_size))
+  ;
+};
+
+add_base(epoll_desc, epoll_cfg);
+add_base(io_uring_desc, io_uring_cfg);
+
+io_uring_desc.add_options()
+  ("provide_buffers",  po::value(&io_uring_cfg.provide_buffers)
+     ->default_value(io_uring_cfg.provide_buffers))
+  ("fixed_files",  po::value(&io_uring_cfg.fixed_files)
+     ->default_value(io_uring_cfg.fixed_files))
+  ("loop_recv", po::value(&io_uring_cfg.loop_recv)
+     ->default_value(io_uring_cfg.loop_recv))
+  ("max_cqe_loop",  po::value(&io_uring_cfg.max_cqe_loop)
+     ->default_value(io_uring_cfg.max_cqe_loop))
+  ("supports_nonblock_accept",  po::value(&io_uring_cfg.supports_nonblock_accept)
+     ->default_value(io_uring_cfg.supports_nonblock_accept))
+  ("register_ring",  po::value(&io_uring_cfg.register_ring)
+     ->default_value(io_uring_cfg.register_ring))
+  ("sqe_count", po::value(&io_uring_cfg.sqe_count)
+     ->default_value(io_uring_cfg.sqe_count))
+  ("provided_buffer_count", po::value(&io_uring_cfg.provided_buffer_count)
+     ->default_value(io_uring_cfg.provided_buffer_count))
+  ("fixed_file_count", po::value(&io_uring_cfg.fixed_file_count)
+     ->default_value(io_uring_cfg.fixed_file_count))
+  ;
+  // clang-format on
+
+  po::options_description* used_desc = NULL;
+  auto const [engine, splits] = getRxEngine(parse);
+  switch (engine) {
+    case RxEngine::IoUring:
+      used_desc = &io_uring_desc;
+      break;
+    case RxEngine::Epoll:
+      used_desc = &epoll_desc;
+      break;
+  };
+
+  po::variables_map vm;
+  {
+    std::vector<char const*> split_chars;
+    for (auto const& s : splits) {
+      split_chars.push_back(s.c_str());
+    }
+    po::store(
+        po::parse_command_line(
+            split_chars.size(), split_chars.data(), *used_desc),
+        vm);
+  }
+  po::notify(vm);
+  if (vm.count("help")) {
+    std::cerr << *used_desc << "\n";
+    exit(1);
+  }
+
+  switch (engine) {
+    case RxEngine::IoUring:
+      return [io_uring_cfg](Config const& cfg) -> Receiver {
+        return makeIoUringRx(cfg, io_uring_cfg);
+      };
+    case RxEngine::Epoll:
+      return [epoll_cfg](Config const& cfg) -> Receiver {
+        return makeEpollRx(cfg, epoll_cfg);
+      };
+      break;
+  };
+  die("bad engine ", (int)engine);
+  return {};
+}
+
 int main(int argc, char** argv) {
   Config const cfg = parse(argc, argv);
   signal(SIGINT, intHandler);
   std::vector<std::function<Receiver()>> receiver_factories;
-  auto const all_rx = allRx();
-  auto mk_recv_fact = [&cfg](auto it) {
-    return [&cfg, name = it->first, fn = it->second]() -> Receiver {
-      Receiver r = fn(cfg);
-      r.name = name;
-      return r;
-    };
-  };
   for (auto const& rx : cfg.rx) {
-    if (rx == "all") {
-      for (auto it = all_rx.begin(); it != all_rx.end(); ++it) {
-        receiver_factories.push_back(mk_recv_fact(it));
-      }
-    } else if (auto it = all_rx.find(rx); it != all_rx.end()) {
-      receiver_factories.push_back(mk_recv_fact(it));
-    } else {
-      die("no rx ", rx);
-    }
+    receiver_factories.push_back(
+        [&cfg, parsed = parseRx(rx)]() -> Receiver { return parsed(cfg); });
   }
 
   if (cfg.client_only) {
