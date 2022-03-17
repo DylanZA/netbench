@@ -227,12 +227,8 @@ class RxStats {
     struct tms times_now {};
     clock_t clock_now = checkedErrno(::times(&times_now), "loop times");
 
-    if (requests > lastRequests_) {
+    if (requests > lastRequests_ || lastRps_) {
       char buff[2048];
-      if (!rps && !lastRps_) {
-        lastStats_ = now;
-        return;
-      }
       // use snprintf as I like the floating point formatting
       int written = snprintf(
           buff,
