@@ -1140,7 +1140,12 @@ Receiver makeEpollRx(Config const& cfg, EpollRxConfig const& rx_cfg) {
 
 template <size_t flags>
 struct BasicSockPicker {
-  using Sock = BasicSock<4096, flags>;
+  // if using buffer provider, don't need any buffer
+  // except for to do sending
+  using Sock = std::conditional_t<
+      flags & kUseBufferProviderFlag,
+      BasicSock<4096, flags>,
+      BasicSock<64, flags>>;
 };
 
 Receiver makeIoUringRx(Config const& cfg, IoUringRxConfig const& rx_cfg) {
