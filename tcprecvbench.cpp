@@ -180,7 +180,7 @@ struct ProtocolParser {
 
 class RxStats {
  public:
-  RxStats() {
+  RxStats(std::string const& name) : name_(name) {
     auto const now = std::chrono::steady_clock::now();
     started_ = lastStats_ = now;
     lastClock_ = checkedErrno(times(&lastTimes_), "initial times");
@@ -237,9 +237,9 @@ class RxStats {
       int written = snprintf(
           buff,
           sizeof(buff),
-          "rx (port=%d): rps:%6.2fk Bps:%6.2fM idle=%lums "
+          "%s: rps:%6.2fk Bps:%6.2fM idle=%lums "
           "user=%lums system=%lums wall=%lums loops=%lu",
-          port,
+          name_.c_str(),
           rps / 1000.0,
           bps / 1000000.0,
           duration_cast<milliseconds>(idle_).count(),
@@ -261,9 +261,8 @@ class RxStats {
     lastRps_ = rps;
   }
 
- uint16_t port;
-
  private:
+  std::string const& name_;
   std::chrono::steady_clock::time_point started_ =
       std::chrono::steady_clock::now();
   std::chrono::steady_clock::time_point lastStats_ =
@@ -287,6 +286,10 @@ class RxStats {
 
 class RunnerBase {
  public:
+  explicit RunnerBase(std::string const& name) : name_(name) {}
+  std::string const& name() const {
+    return name_;
+  }
   virtual void loop(std::atomic<bool>* should_shutdown) = 0;
   virtual void stop() = 0;
   virtual ~RunnerBase() = default;
@@ -322,11 +325,13 @@ class RunnerBase {
   size_t bytesRx_ = 0;
 
  private:
+  std::string const name_;
   int socks_ = 0;
 };
 
 class NullRunner : public RunnerBase {
  public:
+  explicit NullRunner(std::string const& name) : RunnerBase(name) {}
   void loop(std::atomic<bool>*) override {}
   void stop() override {}
 };
@@ -507,8 +512,9 @@ struct ListenSock : private boost::noncopyable {
 
 template <class TSock>
 struct IOUringRunner : public RunnerBase {
-  explicit IOUringRunner(Config const& cfg)
-      : cfg_(cfg),
+  explicit IOUringRunner(Config const& cfg, std::string const& name)
+      : RunnerBase(name),
+        cfg_(cfg),
         ring(mkIoUring(cfg)),
         buffers_(cfg.io_uring_buffers, cfg.recv_size) {
     cqes_.resize(cfg.max_events);
@@ -749,7 +755,7 @@ struct IOUringRunner : public RunnerBase {
   }
 
   void loop(std::atomic<bool>* should_shutdown) override {
-    RxStats rx_stats;
+    RxStats rx_stats{name()};
     struct __kernel_timespec timeout;
     timeout.tv_sec = 1;
     timeout.tv_nsec = 0;
@@ -758,7 +764,6 @@ struct IOUringRunner : public RunnerBase {
       io_uring_register_ring_fd(&ring);
     }
 
-    rx_stats.port = port;
     while (socks() || !stopping) {
       submit();
 
@@ -869,7 +874,8 @@ struct EPollData {
 };
 
 struct EPollRunner : public RunnerBase {
-  explicit EPollRunner(Config const& cfg) : cfg_(cfg) {
+  explicit EPollRunner(Config const& cfg, std::string const& name)
+      : RunnerBase(name), cfg_(cfg) {
     epoll_fd = checkedErrno(epoll_create(cfg.max_events), "epoll_create");
     rcvbuff.resize(cfg.recv_size);
     events.resize(cfg.max_events);
@@ -1017,7 +1023,7 @@ struct EPollRunner : public RunnerBase {
   void stop() override {}
 
   void loop(std::atomic<bool>* should_shutdown) override {
-    RxStats rx_stats;
+    RxStats rx_stats{name()};
     while (!should_shutdown->load() && !globalShouldShutdown.load()) {
       rx_stats.startWait();
       int nevents = checkedErrno(
@@ -1088,7 +1094,8 @@ uint16_t pickPort(Config const& config) {
 
 template <class TSock = BasicSock<>>
 std::unique_ptr<RunnerBase> prep_io_uring(Config const& cfg, uint16_t port) {
-  auto runner = std::make_unique<IOUringRunner<TSock>>(cfg);
+  auto runner =
+      std::make_unique<IOUringRunner<TSock>>(cfg, strcat("io_uring port=", port));
   // io_uring doesnt seem to like accepting on a nonblocking socket
   int flags = cfg.io_uring_supports_nonblock_accept ? SOCK_NONBLOCK : 0;
   runner->addListenSock(
@@ -1100,7 +1107,7 @@ std::unique_ptr<RunnerBase> prep_io_uring(Config const& cfg, uint16_t port) {
 }
 
 std::unique_ptr<RunnerBase> prep_epoll(Config const& cfg, uint16_t port) {
-  auto runner = std::make_unique<EPollRunner>(cfg);
+  auto runner = std::make_unique<EPollRunner>(cfg, strcat("epoll port=", port));
   runner->addListenSock(
       mkServerSock(cfg, port, cfg.send_options.ipv6, SOCK_NONBLOCK),
       cfg.send_options.ipv6);
@@ -1331,7 +1338,9 @@ int main(int argc, char** argv) {
     for (auto port : cfg.use_port) {
       receiver_factories.push_back([port]() -> Receiver {
         return Receiver{
-            std::make_unique<NullRunner>(), port, strcat("given_port_", port)};
+            std::make_unique<NullRunner>(strcat("null port=", port)),
+            port,
+            strcat("given_port port=", port)};
       });
     }
   }
