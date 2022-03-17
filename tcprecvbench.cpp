@@ -1509,7 +1509,7 @@ int main(int argc, char** argv) {
     }
   }
 
-  std::vector<std::string> results;
+  std::vector<std::pair<std::string, std::string>> results;
   if (cfg.tx.size()) {
     log("sending using ",
         cfg.send_options.threads,
@@ -1534,14 +1534,13 @@ int main(int argc, char** argv) {
         log("...done sender");
         rcv_thread.join();
         log("...done receiver");
-        results.push_back(strcat(
-            leftpad(strcat(tx, "_", rcv.name, "_", rcv.rxCfg), 40),
-            ": ",
-            res.toString()));
+        results.emplace_back(
+            strcat(tx, "_", rcv.name, "_", rcv.rxCfg), res.toString());
       }
     }
     for (auto const& r : results) {
-      log(r);
+      log(r.first);
+      log(std::string(30, ' '), r.second);
     }
   } else {
     // no built in sender mode
