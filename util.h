@@ -57,9 +57,9 @@ inline std::string leftpad(std::string x, size_t n) {
 struct InterruptedException : std::exception {};
 
 template <typename... T>
-inline int checkedErrno(int res, const T&... vals) {
+inline int checkedErrno(int64_t res, const T&... vals) {
   if (res < 0) {
-    int error = res == -1 ? errno : -res;
+    int64_t error = res == -1 ? errno : -res;
     if (error == EINTR) {
       throw InterruptedException{};
     }
