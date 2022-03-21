@@ -1,6 +1,5 @@
 #include <boost/algorithm/string/join.hpp>
 #include <boost/core/noncopyable.hpp>
-#include <boost/program_options.hpp>
 #include <string_view>
 #include <thread>
 #include <unordered_set>
@@ -1455,7 +1454,6 @@ std::function<Receiver(Config const&)> parseRx(std::string const& parse) {
   // clang-format off
 auto add_base = [&](po::options_description& d, RxConfig& cfg) {
   d.add_options()
-("help", "produce help message")
 ("backlog", po::value(&cfg.backlog)->default_value(cfg.backlog))
 ("max_events", po::value(&cfg.max_events)->default_value(cfg.max_events))
 ("recv_size", po::value(&cfg.recv_size)->default_value(cfg.recv_size))
@@ -1502,22 +1500,7 @@ io_uring_desc.add_options()
       break;
   };
 
-  po::variables_map vm;
-  {
-    std::vector<char const*> split_chars;
-    for (auto const& s : splits) {
-      split_chars.push_back(s.c_str());
-    }
-    po::store(
-        po::parse_command_line(
-            split_chars.size(), split_chars.data(), *used_desc),
-        vm);
-  }
-  po::notify(vm);
-  if (vm.count("help")) {
-    std::cerr << *used_desc << "\n";
-    exit(1);
-  }
+  simpleParse(*used_desc, splits);
 
   switch (engine) {
     case RxEngine::IoUring:

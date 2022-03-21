@@ -11,6 +11,8 @@
 #include <sys/socket.h>
 #include <sys/types.h>
 
+#include <boost/program_options.hpp>
+
 float logTime();
 void setVerbose();
 bool isVerbose();
@@ -101,3 +103,8 @@ inline auto wrapThread(std::string name, FN&& fn) {
 }
 
 } // namespace
+
+
+boost::program_options::variables_map simpleParse(
+    boost::program_options::options_description desc,
+    std::vector<std::string> const& splits);

@@ -22,6 +22,7 @@ struct SendOptions {
 };
 
 struct BurstResult {
+  std::chrono::microseconds p100 = {};
   std::chrono::microseconds p95 = {};
   std::chrono::microseconds p50 = {};
   std::chrono::microseconds avg = {};
@@ -33,11 +34,13 @@ struct BurstResult {
       return ret;
     }
     for (auto& b : bs) {
+      ret.p100 += b.p100;
       ret.p95 += b.p95;
       ret.p50 += b.p50;
       ret.avg += b.avg;
       ret.count += b.count;
     }
+    ret.p100 /= bs.size();
     ret.p95 /= bs.size();
     ret.p50 /= bs.size();
     ret.avg /= bs.size();
@@ -84,6 +87,8 @@ struct SendResults {
         " burst_avg=",
         r.avg.count(),
         "us ",
+        " burst_p100=",
+        r.p100.count(),
         " burst_done_in_time=",
         r.count);
   }

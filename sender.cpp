@@ -1,4 +1,5 @@
 #include "sender.h"
+#include <boost/program_options.hpp>
 #include <boost/thread/barrier.hpp>
 #include <algorithm>
 #include <deque>
@@ -13,6 +14,7 @@
 #include <sys/socket.h>
 #include <sys/types.h>
 
+namespace po = boost::program_options;
 using TClock = std::chrono::steady_clock;
 enum class ActionOp {
   Unknown = 0,
@@ -85,6 +87,7 @@ class BurstStatCollector {
     }
     std::sort(durations.begin(), durations.end());
     ret.count = entries_.size();
+    ret.p100 = durations.back();
     ret.p95 = durations[(int)(durations.size() * 0.95)];
     ret.p50 = durations[durations.size() / 2];
     ret.avg =
@@ -120,6 +123,12 @@ class IBenchmarkScenario {
   virtual void doneError(uint64_t idx, ActionOp op, int error) = 0;
   virtual std::vector<BurstResult> burstResults() const {
     return {};
+  }
+
+  virtual void parseMore(std::vector<std::string> const& split_args) {
+    if (split_args.size() != 1) {
+      die("this scenario does not support more args");
+    }
   }
 };
 
@@ -222,6 +231,70 @@ TClock::time_point fromWaitParam(uint64_t val) {
   return getEpoch() + std::chrono::microseconds(val);
 }
 
+class BurstySend2 : public BenchmarkScenarioBase {
+ public:
+  BurstySend2(uint64_t conns, uint64_t size) : conns_(conns), sendSize_(size) {
+    for (uint64_t c = 1; c <= conns_; c++) {
+      queue.emplace_back(Action(ActionOp::Connect, c));
+    }
+    queue.emplace_back(Action(ActionOp::Ready, 0));
+    connections_.reserve(conns + 1);
+  }
+
+  void newBurst() {
+    if (stats_.any()) {
+      burstResults_.push_back(stats_.collect());
+    }
+    for (uint64_t idx : connections_) {
+      queue.emplace_back(ActionOp::Send, idx, sendSize_);
+      outstanding_++;
+    }
+    stats_ = {};
+  }
+
+  void doneLast(uint64_t idx, ActionOp op) override {
+    switch (op) {
+      case ActionOp::Ready:
+        newBurst();
+        break;
+      case ActionOp::Send:
+        queue.emplace_back(ActionOp::Recv, idx, 1);
+        break;
+      case ActionOp::Recv:
+        stats_.add(idx);
+        --outstanding_;
+        if (outstanding_ < 0) {
+          die("negative outstanding!");
+        } else if (outstanding_ == 0) {
+          newBurst();
+        }
+        break;
+      case ActionOp::Connect:
+        connections_.push_back(idx);
+        break;
+      default:
+        break;
+    };
+  }
+
+  void doneError(uint64_t idx, ActionOp op, int error) override {
+    vlog("doneError ", toString(op), " error=", error);
+  }
+
+  std::vector<BurstResult> burstResults() const override {
+    vlog("burstResults size=", burstResults_.size());
+    return burstResults_;
+  }
+
+ private:
+  uint64_t conns_;
+  uint64_t sendSize_;
+  uint64_t outstanding_ = 0;
+  std::vector<uint64_t> connections_;
+  std::vector<BurstResult> burstResults_;
+  BurstStatCollector stats_;
+};
+
 class BurstySend : public BenchmarkScenarioBase {
  public:
   BurstySend(uint64_t conns, uint64_t size, std::chrono::microseconds period)
@@ -231,6 +304,17 @@ class BurstySend : public BenchmarkScenarioBase {
     }
     queue.emplace_back(Action(ActionOp::Ready, 0));
     connections_.resize(conns + 1);
+  }
+
+  void parseMore(std::vector<std::string> const& split_args) override {
+    po::options_description desc;
+    uint64_t period_us =
+        std::chrono::duration_cast<std::chrono::microseconds>(period_).count();
+    desc.add_options()(
+        "period_us", po::value(&period_us)->default_value(period_us));
+
+    simpleParse(desc, split_args);
+    period_ = std::chrono::microseconds(period_us);
   }
 
   void addSend(uint64_t idx) {
@@ -287,7 +371,7 @@ class BurstySend : public BenchmarkScenarioBase {
     while (currentPeriod_ > 0 && now > nextBurstStart_) {
       currentPeriod_++;
       nextBurstStart_ += period_;
-      if (stats_.any()) {
+      if (!stats_.any()) {
         burstResults_.push_back(stats_.collect());
       }
       stats_ = {};
@@ -328,38 +412,50 @@ std::vector<std::string> allScenarios() {
       "single_large",
       "single_small",
       "single_medium",
-      "burst"};
+      "burst",
+      "burst2",
+  };
 }
 
 std::unique_ptr<IBenchmarkScenario> makeScenario(
-    std::string const& test,
+    std::string const& test_args,
     SendOptions const& options) {
+  auto split = po::split_unix(test_args);
+  if (split.size() < 1) {
+    die("no scenario in ", test_args);
+  }
+  auto const& test = split[0];
+  std::unique_ptr<IBenchmarkScenario> ret;
   if (test == "large") {
-    return std::make_unique<ConnectSendLots>(
+    ret = std::make_unique<ConnectSendLots>(
         options.per_thread, options.large_size);
   } else if (test == "medium") {
-    return std::make_unique<ConnectSendLots>(
+    ret = std::make_unique<ConnectSendLots>(
         options.per_thread, options.medium_size);
   } else if (test == "small") {
-    return std::make_unique<ConnectSendLots>(
+    ret = std::make_unique<ConnectSendLots>(
         options.per_thread, options.small_size);
   } else if (test == "single_large") {
-    return std::make_unique<ConnectSendDisconnect>(
+    ret = std::make_unique<ConnectSendDisconnect>(
         options.per_thread, options.large_size);
   } else if (test == "single_medium") {
-    return std::make_unique<ConnectSendDisconnect>(
+    ret = std::make_unique<ConnectSendDisconnect>(
         options.per_thread, options.medium_size);
   } else if (test == "single_small") {
-    return std::make_unique<ConnectSendDisconnect>(
+    ret = std::make_unique<ConnectSendDisconnect>(
         options.per_thread, options.small_size);
+  } else if (test == "burst2") {
+    ret = std::make_unique<BurstySend2>(options.per_thread, options.small_size);
   } else if (test == "burst") {
-    return std::make_unique<BurstySend>(
+    ret = std::make_unique<BurstySend>(
         options.per_thread,
         options.small_size,
         std::chrono::microseconds(1000));
+  } else {
+    die("unknown test ", test_args);
   }
-  die("unknown test ", test);
-  return {};
+  ret->parseMore(split);
+  return ret;
 }
 
 struct Connection {
