@@ -15,6 +15,41 @@
 
 enum class ActionOp { Unknown = 0, Connect, Disconnect, Recv, Send, Ready };
 enum class SenderState { Preparing, WaitingForReady, Running, Closing, Closed };
+
+std::string toString(ActionOp op) {
+  switch (op) {
+    case ActionOp::Unknown:
+      return "Unknown";
+    case ActionOp::Connect:
+      return "Connect";
+    case ActionOp::Disconnect:
+      return "Disconnect";
+    case ActionOp::Recv:
+      return "Recv";
+    case ActionOp::Send:
+      return "Send";
+    case ActionOp::Ready:
+      return "Ready";
+  }
+  return strcat("<BAD OP! ", (int)op, ">");
+}
+
+std::string toString(SenderState s) {
+  switch (s) {
+    case SenderState::Preparing:
+      return "Preparing";
+    case SenderState::WaitingForReady:
+      return "WaitingForReady";
+    case SenderState::Running:
+      return "Running";
+    case SenderState::Closing:
+      return "Closing";
+    case SenderState::Closed:
+      return "Closed";
+  }
+  return strcat("<BAD State! ", (int)s, ">");
+}
+
 int constexpr kPreludeSize = 4;
 
 struct Action {
@@ -340,7 +375,10 @@ class Sender {
       if (a.op == ActionOp::Disconnect) {
         connection->want_close = true;
       } else {
-        die("bad current ", (int)connection->current, " want ", (int)a.op);
+        die("bad current ",
+            toString(connection->current),
+            " want ",
+            toString(a.op));
       }
     }
     connection->current = a.op;
@@ -360,7 +398,7 @@ class Sender {
         queueNewSend(connection, a.param);
         break;
       default:
-        die("bad op ", (int)a.op);
+        die("bad op ", toString(a.op));
     };
   }
 
@@ -473,7 +511,7 @@ class Sender {
           if (res != -ECONNRESET) {
             vlog(
                 "sender: send res < 0: was=",
-                (int)was,
+                toString(was),
                 " fd=",
                 connection->fd,
                 " res=",
@@ -484,8 +522,6 @@ class Sender {
         } else if (res > 0) {
           connection->remaining -= std::min<size_t>(connection->remaining, res);
           if (connection->remaining > 0) {
-            // log("was was ", (int)was, " to write ", connection->remaining, "
-            // res=", res);
             queueSend(connection);
             finished = false;
           } else {
@@ -499,7 +535,7 @@ class Sender {
         kill = true;
         break;
       default:
-        vlog("sender: weird current action ", (int)was, " res=", res);
+        vlog("sender: weird current action ", toString(was), " res=", res);
         kill = true;
         break;
     }
@@ -555,7 +591,7 @@ class Sender {
     if (!cqe_count) {
       vlog(
           "no cqe state=",
-          (int)state_,
+          toString(state_),
           " connections=",
           connections.size(),
           " outstanding=",
