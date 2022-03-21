@@ -13,7 +13,15 @@
 #include <sys/socket.h>
 #include <sys/types.h>
 
-enum class ActionOp { Unknown = 0, Connect, Disconnect, Recv, Send, Ready };
+enum class ActionOp {
+  Unknown = 0,
+  Connect,
+  Disconnect,
+  Recv,
+  Send,
+  Ready,
+  WaitUntil
+};
 enum class SenderState { Preparing, WaitingForReady, Running, Closing, Closed };
 
 std::string toString(ActionOp op) {
@@ -30,6 +38,8 @@ std::string toString(ActionOp op) {
       return "Send";
     case ActionOp::Ready:
       return "Ready";
+    case ActionOp::WaitUntil:
+      return "WaitUntil";
   }
   return strcat("<BAD OP! ", (int)op, ">");
 }
@@ -66,10 +76,25 @@ class IBenchmarkScenario {
   virtual ~IBenchmarkScenario() = default;
   virtual bool getAction(Action& a) = 0;
   virtual void doneLast(uint64_t idx, ActionOp op) = 0;
-  virtual void doneError(uint64_t idx, int error) = 0;
+  virtual void doneError(uint64_t idx, ActionOp op, int error) = 0;
 };
 
-class ConnectSendLots : public IBenchmarkScenario {
+class BenchmarkScenarioBase : public IBenchmarkScenario {
+ public:
+  bool getAction(Action& out) override {
+    if (queue.empty())
+      return false;
+    out = std::move(queue.front());
+    queue.pop_front();
+    return true;
+  }
+
+  void doneError(uint64_t idx, ActionOp op, int error) override {}
+
+ protected:
+  std::deque<Action> queue;
+};
+class ConnectSendLots : public BenchmarkScenarioBase {
  public:
   ConnectSendLots(uint64_t conns, uint64_t size)
       : conns_(conns), sendSize_(size) {
@@ -77,14 +102,6 @@ class ConnectSendLots : public IBenchmarkScenario {
       queue.emplace_back(Action(ActionOp::Connect, c));
     }
     queue.emplace_back(Action(ActionOp::Ready, 0));
-  }
-
-  bool getAction(Action& out) override {
-    if (queue.empty())
-      return false;
-    out = std::move(queue.front());
-    queue.pop_front();
-    return true;
   }
 
   void doneLast(uint64_t idx, ActionOp op) override {
@@ -101,15 +118,12 @@ class ConnectSendLots : public IBenchmarkScenario {
     };
   }
 
-  void doneError(uint64_t idx, int error) override {}
-
  private:
   uint64_t conns_;
   uint64_t sendSize_;
-  std::deque<Action> queue;
 };
 
-class ConnectSendDisconnect : public IBenchmarkScenario {
+class ConnectSendDisconnect : public BenchmarkScenarioBase {
  public:
   ConnectSendDisconnect(uint64_t concurrent, uint64_t send)
       : concurrent_(concurrent), send_(send) {
@@ -117,14 +131,6 @@ class ConnectSendDisconnect : public IBenchmarkScenario {
       queue.emplace_back(Action(ActionOp::Connect, nextIdx_++));
     }
     queue.emplace_back(Action(ActionOp::Ready, 0));
-  }
-
-  bool getAction(Action& out) override {
-    if (queue.empty())
-      return false;
-    out = std::move(queue.front());
-    queue.pop_front();
-    return true;
   }
 
   void doneLast(uint64_t idx, ActionOp op) override {
@@ -144,7 +150,7 @@ class ConnectSendDisconnect : public IBenchmarkScenario {
     }
   }
 
-  void doneError(uint64_t idx, int error) override {
+  void doneError(uint64_t idx, ActionOp op, int error) override {
     queue.emplace_back(ActionOp::Connect, nextIdx_++);
   }
 
@@ -152,7 +158,102 @@ class ConnectSendDisconnect : public IBenchmarkScenario {
   uint64_t nextIdx_ = 1;
   uint64_t concurrent_;
   uint64_t send_;
-  std::deque<Action> queue;
+};
+
+std::chrono::steady_clock::time_point getEpoch() {
+  static std::chrono::steady_clock::time_point const kEpoch =
+      std::chrono::steady_clock::now();
+  return kEpoch;
+}
+
+uint64_t mkWaitParam(std::chrono::steady_clock::time_point to) {
+  using namespace std::chrono;
+  auto epoch = getEpoch();
+  if (to < epoch) {
+    return 0;
+  }
+  return duration_cast<microseconds>(to - epoch).count();
+}
+
+std::chrono::steady_clock::time_point fromWaitParam(uint64_t val) {
+  return getEpoch() + std::chrono::microseconds(val);
+}
+
+class BurstySend : public BenchmarkScenarioBase {
+ public:
+  BurstySend(uint64_t conns, uint64_t size, std::chrono::microseconds period)
+      : conns_(conns), sendSize_(size), period_(period) {
+    for (uint64_t c = 1; c <= conns_; c++) {
+      queue.emplace_back(Action(ActionOp::Connect, c));
+    }
+    queue.emplace_back(Action(ActionOp::Ready, 0));
+    connections_.resize(conns + 1);
+  }
+
+  void addSend(uint64_t idx) {
+    queue.emplace_back(ActionOp::Send, idx, sendSize_);
+    connections_[idx].currentPeriod++;
+  }
+
+  void doneLast(uint64_t idx, ActionOp op) override {
+    vlog("doneLast: ", idx, " ", toString(op));
+    auto const now = std::chrono::steady_clock::now();
+    switch (op) {
+      case ActionOp::Ready:
+        burstStart_ = now;
+        nextBurstStart_ = burstStart_ + period_;
+        currentPeriod_ = 1;
+        for (uint64_t i = 0; i < connections_.size(); i++) {
+          if (connections_[i].connected) {
+            addSend(i);
+          }
+        }
+        break;
+      case ActionOp::Send:
+        queue.emplace_back(ActionOp::Recv, idx, 1);
+        break;
+      case ActionOp::WaitUntil:
+      case ActionOp::Recv:
+        if (connections_[idx].currentPeriod < currentPeriod_) {
+          addSend(idx);
+        } else {
+          queue.emplace_back(
+              ActionOp::WaitUntil, idx, mkWaitParam(nextBurstStart_));
+        }
+        break;
+      case ActionOp::Connect:
+        connections_[idx].connected = true;
+        break;
+      default:
+        break;
+    };
+    checkBurstTime(now);
+  }
+
+  void doneError(uint64_t idx, ActionOp op, int error) override {
+    vlog("doneError ", toString(op), " error=", error);
+  }
+
+  void checkBurstTime(std::chrono::steady_clock::time_point now) {
+    while (now > nextBurstStart_) {
+      currentPeriod_++;
+      nextBurstStart_ += period_;
+    }
+  }
+
+ private:
+  struct ConnState {
+    uint64_t currentPeriod = 0;
+    bool connected = false;
+  };
+
+  uint64_t conns_;
+  uint64_t sendSize_;
+  std::chrono::steady_clock::time_point burstStart_;
+  std::chrono::steady_clock::time_point nextBurstStart_;
+  std::chrono::microseconds period_;
+  uint64_t currentPeriod_ = 0;
+  std::vector<ConnState> connections_;
 };
 
 std::vector<std::string> allScenarios() {
@@ -162,7 +263,8 @@ std::vector<std::string> allScenarios() {
       "medium",
       "single_large",
       "single_small",
-      "single_medium"};
+      "single_medium",
+      "burst"};
 }
 
 std::unique_ptr<IBenchmarkScenario> makeScenario(
@@ -186,6 +288,9 @@ std::unique_ptr<IBenchmarkScenario> makeScenario(
   } else if (test == "single_small") {
     return std::make_unique<ConnectSendDisconnect>(
         options.per_thread, options.small_size);
+  } else if (test == "burst") {
+    return std::make_unique<BurstySend>(
+        options.per_thread, options.small_size, std::chrono::microseconds(100));
   }
   die("unknown test ", test);
   return {};
@@ -315,6 +420,7 @@ class Sender {
       end_ = std::chrono::steady_clock::now() +
           std::chrono::milliseconds(
                  static_cast<uint64_t>(cfg_.run_seconds * 1000.0));
+      scenario->doneLast(0, ActionOp::Ready);
       state_ = SenderState::Running;
     }
     switch (state_) {
@@ -397,6 +503,9 @@ class Sender {
       case ActionOp::Send:
         queueNewSend(connection, a.param);
         break;
+      case ActionOp::WaitUntil:
+        queueWaitUntil(connection, a.param);
+        break;
       default:
         die("bad op ", toString(a.op));
     };
@@ -472,6 +581,30 @@ class Sender {
     io_uring_sqe_set_data(sqe, (void*)connection->id);
   }
 
+  void queueWaitUntil(Connection* connection, uint64_t wait) {
+    waits_[fromWaitParam(wait)].connections.push_back(connection->id);
+  }
+
+  void processWaits(std::chrono::steady_clock::time_point t) {
+    for (auto it = waits_.begin(); it != waits_.end() && it->first <= t;
+         it = waits_.erase(it)) {
+      for (uint64_t idx : it->second.connections) {
+        Connection* c = tryGetConnection(idx, false);
+        if (!c) {
+          continue;
+        }
+        if (c->current == ActionOp::Disconnect) {
+          // ignore, closed in the middle
+          continue;
+        }
+        if (c->current != ActionOp::WaitUntil) {
+          die("expected waituntil but had ", toString(c->current));
+        }
+        processRes(c, 0);
+      }
+    }
+  }
+
   void processRes(Connection* connection, int res) {
     bool finished = true;
     bool waserror = false;
@@ -504,6 +637,9 @@ class Sender {
           // finished
           connection->remaining = 0;
         }
+        break;
+      case ActionOp::WaitUntil:
+        // nothing to do, but use normal processing
         break;
       case ActionOp::Send:
         if (res <= 0) {
@@ -547,7 +683,7 @@ class Sender {
     }
 
     if (waserror) {
-      scenario->doneError(connection->id, res);
+      scenario->doneError(connection->id, was, res);
       connection->want_close = true;
     } else {
       scenario->doneLast(connection->id, was);
@@ -580,8 +716,26 @@ class Sender {
 
   void processCompletions() {
     struct __kernel_timespec timeout;
-    timeout.tv_sec = 1;
-    timeout.tv_nsec = 0;
+    if (waits_.size()) {
+      auto now = std::chrono::steady_clock::now();
+      auto until = waits_.begin()->first;
+      if (until <= now) {
+        timeout.tv_sec = 0;
+        timeout.tv_nsec = 1;
+      } else if (until >= now + std::chrono::seconds(1)) {
+        timeout.tv_sec = 1;
+        timeout.tv_nsec = 0;
+      } else {
+        timeout.tv_sec = 0;
+        timeout.tv_nsec =
+            std::chrono::duration_cast<std::chrono::nanoseconds>(now - until)
+                .count();
+      }
+    } else {
+      timeout.tv_sec = 1;
+      timeout.tv_nsec = 0;
+    }
+
     struct io_uring_cqe* cqes[1024];
     checkedErrno(
         io_uring_wait_cqe_timeout(&ring_, &cqes[0], &timeout),
@@ -604,6 +758,7 @@ class Sender {
     for (int i = 0; i < cqe_count; i++) {
       processCqe(cqes[i]);
     }
+    processWaits(std::chrono::steady_clock::now());
   }
 
   struct io_uring_sqe* get_sqe() {
@@ -679,6 +834,10 @@ class Sender {
     }
   }
 
+  struct WaitData {
+    std::vector<uint64_t> connections;
+  };
+
   SendOptions const cfg_;
   SendBuffers const& buffers;
   std::unique_ptr<IBenchmarkScenario> scenario;
@@ -692,6 +851,7 @@ class Sender {
   socklen_t addrLen_;
   std::chrono::steady_clock::time_point end_;
   std::vector<uint64_t> toClose;
+  std::map<std::chrono::steady_clock::time_point, WaitData> waits_;
 
   size_t bytesSent_ = 0;
   size_t packetsSent_ = 0;
