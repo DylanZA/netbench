@@ -58,18 +58,15 @@ struct SendResults {
   size_t recvErrors = 0;
   std::vector<BurstResult> burstResults;
 
-  static SendResults merge(SendResults const& a, SendResults const& b) {
-    SendResults ret;
-    ret.packetsPerSecond = a.packetsPerSecond + b.packetsPerSecond;
-    ret.bytesPerSecond = a.bytesPerSecond + b.bytesPerSecond;
-    ret.sendErrors = a.sendErrors + b.sendErrors;
-    ret.recvErrors = a.recvErrors + b.recvErrors;
-    ret.connectErrors = a.connectErrors + b.connectErrors;
-    ret.connects = a.connects + b.connects;
-    ret.burstResults = a.burstResults;
-    ret.burstResults.insert(
-        ret.burstResults.end(), b.burstResults.begin(), b.burstResults.end());
-    return ret;
+  void mergeIn(SendResults&& b) {
+    packetsPerSecond += b.packetsPerSecond;
+    bytesPerSecond += b.bytesPerSecond;
+    sendErrors += b.sendErrors;
+    recvErrors += b.recvErrors;
+    connectErrors += b.connectErrors;
+    connects += b.connects;
+    burstResults.insert(
+        burstResults.end(), b.burstResults.begin(), b.burstResults.end());
   }
 
   std::string burstString() const {

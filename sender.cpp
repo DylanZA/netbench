@@ -1055,6 +1055,11 @@ runSender(std::string const& test, SendOptions const& options, uint16_t port) {
   for (auto& t : threads) {
     t.join();
   }
-  return std::accumulate(
-      results.begin(), results.end(), SendResults{}, SendResults::merge);
+
+  // std::accumulate is a bit slow
+  SendResults ret;
+  for(auto& r : results) {
+    ret.mergeIn(std::move(r));
+  }
+  return ret;
 }
