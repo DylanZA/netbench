@@ -13,6 +13,7 @@
 #include <sys/socket.h>
 #include <sys/types.h>
 
+using TClock = std::chrono::steady_clock;
 enum class ActionOp {
   Unknown = 0,
   Connect,
@@ -62,6 +63,46 @@ std::string toString(SenderState s) {
 
 int constexpr kPreludeSize = 4;
 
+class BurstStatCollector {
+ public:
+  bool any() const {
+    return entries_.size() > 0;
+  }
+
+  void add(uint64_t idx) {
+    entries_.emplace_back(idx, TClock::now());
+  }
+
+  BurstResult collect() const {
+    using namespace std::chrono;
+    BurstResult ret;
+    if (entries_.size() == 0) {
+      return ret;
+    }
+    std::vector<microseconds> durations;
+    for (auto const& e : entries_) {
+      durations.push_back(duration_cast<microseconds>(e.time - start_));
+    }
+    std::sort(durations.begin(), durations.end());
+    ret.count = entries_.size();
+    ret.p95 = durations[(int)(durations.size() * 0.95)];
+    ret.p50 = durations[durations.size() / 2];
+    ret.avg =
+        std::accumulate(durations.begin(), durations.end(), microseconds(0)) /
+        durations.size();
+    return ret;
+  }
+
+ private:
+  struct Entry {
+    Entry(uint64_t i, TClock::time_point t) : idx(i), time(t) {}
+    uint64_t idx;
+    TClock::time_point time;
+  };
+  TClock::time_point start_ = TClock::now();
+  std::vector<Entry> entries_;
+};
+
 struct Action {
   Action() = default;
   Action(ActionOp o, uint64_t id, uint64_t param = 0)
@@ -77,6 +118,9 @@ class IBenchmarkScenario {
   virtual bool getAction(Action& a) = 0;
   virtual void doneLast(uint64_t idx, ActionOp op) = 0;
   virtual void doneError(uint64_t idx, ActionOp op, int error) = 0;
+  virtual std::vector<BurstResult> burstResults() const {
+    return {};
+  }
 };
 
 class BenchmarkScenarioBase : public IBenchmarkScenario {
@@ -160,13 +204,12 @@ class ConnectSendDisconnect : public BenchmarkScenarioBase {
   uint64_t send_;
 };
 
-std::chrono::steady_clock::time_point getEpoch() {
-  static std::chrono::steady_clock::time_point const kEpoch =
-      std::chrono::steady_clock::now();
+TClock::time_point getEpoch() {
+  static TClock::time_point const kEpoch = TClock::now();
   return kEpoch;
 }
 
-uint64_t mkWaitParam(std::chrono::steady_clock::time_point to) {
+uint64_t mkWaitParam(TClock::time_point to) {
   using namespace std::chrono;
   auto epoch = getEpoch();
   if (to < epoch) {
@@ -175,7 +218,7 @@ uint64_t mkWaitParam(std::chrono::steady_clock::time_point to) {
   return duration_cast<microseconds>(to - epoch).count();
 }
 
-std::chrono::steady_clock::time_point fromWaitParam(uint64_t val) {
+TClock::time_point fromWaitParam(uint64_t val) {
   return getEpoch() + std::chrono::microseconds(val);
 }
 
@@ -196,12 +239,12 @@ class BurstySend : public BenchmarkScenarioBase {
   }
 
   void doneLast(uint64_t idx, ActionOp op) override {
-    vlog("doneLast: ", idx, " ", toString(op));
-    auto const now = std::chrono::steady_clock::now();
+    auto const now = TClock::now();
     switch (op) {
       case ActionOp::Ready:
         burstStart_ = now;
         nextBurstStart_ = burstStart_ + period_;
+        stats_ = {};
         currentPeriod_ = 1;
         for (uint64_t i = 0; i < connections_.size(); i++) {
           if (connections_[i].connected) {
@@ -212,8 +255,13 @@ class BurstySend : public BenchmarkScenarioBase {
       case ActionOp::Send:
         queue.emplace_back(ActionOp::Recv, idx, 1);
         break;
-      case ActionOp::WaitUntil:
       case ActionOp::Recv:
+      case ActionOp::WaitUntil:
+        if (op == ActionOp::Recv &&
+            connections_[idx].currentPeriod == currentPeriod_) {
+          stats_.add(idx);
+        }
+
         if (connections_[idx].currentPeriod < currentPeriod_) {
           addSend(idx);
         } else {
@@ -234,11 +282,25 @@ class BurstySend : public BenchmarkScenarioBase {
     vlog("doneError ", toString(op), " error=", error);
   }
 
-  void checkBurstTime(std::chrono::steady_clock::time_point now) {
-    while (now > nextBurstStart_) {
+  void checkBurstTime(TClock::time_point now) {
+    int loops = 0;
+    while (currentPeriod_ > 0 && now > nextBurstStart_) {
       currentPeriod_++;
       nextBurstStart_ += period_;
+      if (stats_.any()) {
+        burstResults_.push_back(stats_.collect());
+      }
+      stats_ = {};
+      loops++;
     }
+    if (loops > 1) {
+      vlog("checkBurstTime: loops ", loops);
+    }
+  }
+
+  std::vector<BurstResult> burstResults() const override {
+    vlog("burstResults size=", burstResults_.size());
+    return burstResults_;
   }
 
  private:
@@ -249,11 +311,13 @@ class BurstySend : public BenchmarkScenarioBase {
 
   uint64_t conns_;
   uint64_t sendSize_;
-  std::chrono::steady_clock::time_point burstStart_;
-  std::chrono::steady_clock::time_point nextBurstStart_;
+  TClock::time_point burstStart_;
+  TClock::time_point nextBurstStart_;
   std::chrono::microseconds period_;
-  uint64_t currentPeriod_ = 0;
+  uint64_t currentPeriod_ = 0; // 0 indicates not started
   std::vector<ConnState> connections_;
+  std::vector<BurstResult> burstResults_;
+  BurstStatCollector stats_;
 };
 
 std::vector<std::string> allScenarios() {
@@ -290,7 +354,9 @@ std::unique_ptr<IBenchmarkScenario> makeScenario(
         options.per_thread, options.small_size);
   } else if (test == "burst") {
     return std::make_unique<BurstySend>(
-        options.per_thread, options.small_size, std::chrono::microseconds(100));
+        options.per_thread,
+        options.small_size,
+        std::chrono::microseconds(1000));
   }
   die("unknown test ", test);
   return {};
@@ -417,7 +483,7 @@ class Sender {
         return false;
       }
       ready_barrier.wait();
-      end_ = std::chrono::steady_clock::now() +
+      end_ = TClock::now() +
           std::chrono::milliseconds(
                  static_cast<uint64_t>(cfg_.run_seconds * 1000.0));
       scenario->doneLast(0, ActionOp::Ready);
@@ -585,10 +651,12 @@ class Sender {
     waits_[fromWaitParam(wait)].connections.push_back(connection->id);
   }
 
-  void processWaits(std::chrono::steady_clock::time_point t) {
+  uint64_t processWaits(TClock::time_point t) {
+    uint64_t count = 0;
     for (auto it = waits_.begin(); it != waits_.end() && it->first <= t;
          it = waits_.erase(it)) {
       for (uint64_t idx : it->second.connections) {
+        count++;
         Connection* c = tryGetConnection(idx, false);
         if (!c) {
           continue;
@@ -603,6 +671,7 @@ class Sender {
         processRes(c, 0);
       }
     }
+    return count;
   }
 
   void processRes(Connection* connection, int res) {
@@ -717,7 +786,7 @@ class Sender {
   void processCompletions() {
     struct __kernel_timespec timeout;
     if (waits_.size()) {
-      auto now = std::chrono::steady_clock::now();
+      auto now = TClock::now();
       auto until = waits_.begin()->first;
       if (until <= now) {
         timeout.tv_sec = 0;
@@ -728,7 +797,7 @@ class Sender {
       } else {
         timeout.tv_sec = 0;
         timeout.tv_nsec =
-            std::chrono::duration_cast<std::chrono::nanoseconds>(now - until)
+            std::chrono::duration_cast<std::chrono::nanoseconds>(until - now)
                 .count();
       }
     } else {
@@ -742,7 +811,7 @@ class Sender {
         "sender processCompletions");
     int cqe_count =
         io_uring_peek_batch_cqe(&ring_, cqes, sizeof(cqes) / sizeof(cqes[0]));
-    if (!cqe_count) {
+    if (!cqe_count && waits_.empty()) {
       vlog(
           "no cqe state=",
           toString(state_),
@@ -758,7 +827,13 @@ class Sender {
     for (int i = 0; i < cqe_count; i++) {
       processCqe(cqes[i]);
     }
-    processWaits(std::chrono::steady_clock::now());
+    uint64_t const waits_processed = processWaits(TClock::now());
+    if (!cqe_count && !waits_.empty() && !waits_processed) {
+      vlog(
+          "should have processed some waits: slept for ",
+          timeout.tv_nsec,
+          "ns");
+    }
   }
 
   struct io_uring_sqe* get_sqe() {
@@ -777,8 +852,7 @@ class Sender {
   SendResults go() {
     SendResults res;
     while (state_ != SenderState::Closed) {
-      if (state_ == SenderState::Running &&
-          std::chrono::steady_clock::now() > end_) {
+      if (state_ == SenderState::Running && TClock::now() > end_) {
         state_ = SenderState::Closing;
         // close all the connections
         for (auto const& kv : connections) {
@@ -812,6 +886,7 @@ class Sender {
       processCompletions();
     }
 
+    res.burstResults = scenario->burstResults();
     return res;
   }
 
@@ -849,9 +924,9 @@ class Sender {
   SenderState state_ = SenderState::Preparing;
   struct sockaddr_storage addr_;
   socklen_t addrLen_;
-  std::chrono::steady_clock::time_point end_;
+  TClock::time_point end_;
   std::vector<uint64_t> toClose;
-  std::map<std::chrono::steady_clock::time_point, WaitData> waits_;
+  std::map<TClock::time_point, WaitData> waits_;
 
   size_t bytesSent_ = 0;
   size_t packetsSent_ = 0;
