@@ -1292,7 +1292,28 @@ struct BasicSockPicker {
       BasicSock<4096, flags>>;
 };
 
-Receiver makeIoUringRx(Config const& cfg, IoUringRxConfig const& rx_cfg) {
+template <size_t MbFlag>
+void mbIoUringRxFactory(
+    Config const& cfg,
+    IoUringRxConfig const& rx_cfg,
+    std::string const& name,
+    size_t flags,
+    std::unique_ptr<RunnerBase>& runner) {
+  if (flags == MbFlag) {
+    if (runner) {
+      die("already had a runner? flags=", flags, " this=", MbFlag);
+    }
+    runner =
+        std::make_unique<IOUringRunner<typename BasicSockPicker<MbFlag>::Sock>>(
+            cfg, rx_cfg, name);
+  }
+}
+
+template <size_t... PossibleFlag>
+Receiver makeIoUringRx(
+    Config const& cfg,
+    IoUringRxConfig const& rx_cfg,
+    std::index_sequence<PossibleFlag...>) {
   uint16_t port = pickPort(cfg);
 
   std::unique_ptr<RunnerBase> runner;
@@ -1300,26 +1321,16 @@ Receiver makeIoUringRx(Config const& cfg, IoUringRxConfig const& rx_cfg) {
       (rx_cfg.fixed_files ? kUseFixedFilesFlag : 0) |
       (rx_cfg.loop_recv ? kLoopRecvFlag : 0);
 
-  std::string descFlags;
-#define DO_FLAG(x)                                                      \
-  case x:                                                               \
-    runner = std::make_unique<IOUringRunner<BasicSockPicker<x>::Sock>>( \
-        cfg, rx_cfg, strcat("io_uring port=", port));                   \
-    break;
+  ((mbIoUringRxFactory<PossibleFlag>(
+       cfg, rx_cfg, strcat("io_uring port=", port), flags, runner)),
+   ...);
 
-  switch (flags) {
-    // bit bizarre c++ here, want one line for each possible flags combo
-    DO_FLAG(0)
-    DO_FLAG(1)
-    DO_FLAG(2)
-    DO_FLAG(3)
-    DO_FLAG(4)
-    DO_FLAG(5)
-    DO_FLAG(6)
-    DO_FLAG(7)
-    DO_FLAG(8)
-  };
-#undef DO_FLAG
+  if (!runner) {
+    die("no factory for runner flags=",
+        flags,
+        " maybe you need to increase the index sequence "
+        "size in the caller of this");
+  }
 
   // io_uring doesnt seem to like accepting on a nonblocking socket
   int sock_flags = rx_cfg.supports_nonblock_accept ? SOCK_NONBLOCK : 0;
@@ -1511,7 +1522,7 @@ io_uring_desc.add_options()
   switch (engine) {
     case RxEngine::IoUring:
       return [io_uring_cfg](Config const& cfg) -> Receiver {
-        return makeIoUringRx(cfg, io_uring_cfg);
+        return makeIoUringRx(cfg, io_uring_cfg, std::make_index_sequence<16>{});
       };
     case RxEngine::Epoll:
       return [epoll_cfg](Config const& cfg) -> Receiver {
