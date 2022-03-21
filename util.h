@@ -56,8 +56,9 @@ inline std::string leftpad(std::string x, size_t n) {
 
 struct InterruptedException : std::exception {};
 
-template <typename... T>
-inline int checkedErrno(int64_t res, const T&... vals) {
+template <typename TResult, typename... T>
+inline TResult checkedErrno(TResult res, const T&... vals) {
+  static_assert(std::is_integral_v<TResult>, "result type should be integral!");
   if (res < 0) {
     int64_t error = res == -1 ? errno : -res;
     if (error == EINTR) {
