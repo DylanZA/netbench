@@ -57,10 +57,10 @@ struct IoUringRxConfig : RxConfig {
   bool loop_recv = false;
   int sqe_count = 64;
   int max_cqe_loop = 128;
-  int provided_buffer_count = 1024;
+  int provided_buffer_count = 8000;
   int fixed_file_count = 16000;
-  int provided_buffer_low_watermark = 32;
-  int provided_buffer_compact = 0;
+  int provided_buffer_low_watermark = 2000;
+  int provided_buffer_compact = 1;
 
   std::string const toString() const {
     // only give the important options:
