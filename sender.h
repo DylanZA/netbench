@@ -21,32 +21,17 @@ struct SendOptions {
   bool ipv6 = true;
 };
 
-struct BurstResult {
+struct LatencyResult {
   std::chrono::microseconds p100 = {};
   std::chrono::microseconds p95 = {};
   std::chrono::microseconds p50 = {};
   std::chrono::microseconds avg = {};
   double count = 0.0 /* avg count done per burst */;
 
-  static BurstResult avgMerge(std::vector<BurstResult> const& bs) {
-    BurstResult ret;
-    if (bs.empty()) {
-      return ret;
-    }
-    for (auto& b : bs) {
-      ret.p100 += b.p100;
-      ret.p95 += b.p95;
-      ret.p50 += b.p50;
-      ret.avg += b.avg;
-      ret.count += b.count;
-    }
-    ret.p100 /= bs.size();
-    ret.p95 /= bs.size();
-    ret.p50 /= bs.size();
-    ret.avg /= bs.size();
-    ret.count /= (double)bs.size();
-    return ret;
-  }
+  static LatencyResult from(std::vector<std::chrono::microseconds>&& durations);
+  void mergeIn(LatencyResult&& l);
+  static LatencyResult avgMerge(std::vector<LatencyResult> const& bs);
+  std::string toString() const;
 };
 
 struct SendResults {
@@ -56,7 +41,8 @@ struct SendResults {
   size_t connectErrors = 0;
   size_t sendErrors = 0;
   size_t recvErrors = 0;
-  std::vector<BurstResult> burstResults;
+  LatencyResult latencies;
+  std::vector<LatencyResult> burstResults;
 
   void mergeIn(SendResults&& b) {
     packetsPerSecond += b.packetsPerSecond;
@@ -65,6 +51,7 @@ struct SendResults {
     recvErrors += b.recvErrors;
     connectErrors += b.connectErrors;
     connects += b.connects;
+    latencies.mergeIn(std::move(b.latencies));
     burstResults.insert(
         burstResults.end(), b.burstResults.begin(), b.burstResults.end());
   }
@@ -73,21 +60,15 @@ struct SendResults {
     if (burstResults.empty()) {
       return {};
     }
-    auto r = BurstResult::avgMerge(burstResults);
-    return strcat(
-        " burst_p95=",
-        r.p95.count(),
-        "us ",
-        " burst_p50=",
-        r.p50.count(),
-        "us ",
-        " burst_avg=",
-        r.avg.count(),
-        "us ",
-        " burst_p100=",
-        r.p100.count(),
-        " burst_done_in_time=",
-        r.count);
+    auto r = LatencyResult::avgMerge(burstResults);
+    return strcat(" burst={", r.toString(), "}");
+  }
+
+  std::string latencyString() const {
+    if (!latencies.count) {
+      return {};
+    }
+    return strcat(" latency={", latencies.toString(), "}");
   }
 
   std::string toString() const {
@@ -104,6 +85,7 @@ struct SendResults {
         recvErrors,
         " connects=",
         connects,
+        latencyString(),
         burstString());
   }
 };

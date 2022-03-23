@@ -65,6 +65,81 @@ std::string toString(SenderState s) {
 
 int constexpr kPreludeSize = 4;
 
+LatencyResult LatencyResult::from(
+    std::vector<std::chrono::microseconds>&& durations) {
+  LatencyResult ret;
+  if (durations.size() == 0) {
+    return ret;
+  }
+  std::sort(durations.begin(), durations.end());
+  size_t const count = durations.size();
+  ret.count = count;
+  ret.p100 = durations.back();
+  ret.p95 = durations[(int)(durations.size() * 0.95)];
+  ret.p50 = durations[durations.size() / 2];
+  ret.avg =
+      std::accumulate(
+          durations.begin(), durations.end(), std::chrono::microseconds(0)) /
+      durations.size();
+  return ret;
+}
+
+void LatencyResult::mergeIn(LatencyResult&& l) {
+  double const new_count = count + l.count;
+  if (new_count <= 0) {
+    return;
+  }
+  auto upd = [&](std::chrono::microseconds& self,
+                 std::chrono::microseconds const& other) {
+    // todo rounding maybe?
+    int64_t us =
+        (self.count() * this->count + other.count() * l.count) / new_count;
+    self = std::chrono::microseconds{us};
+  };
+  upd(p100, l.p100);
+  upd(p95, l.p95);
+  upd(p50, l.p50);
+  upd(avg, l.avg);
+  count = new_count;
+}
+
+LatencyResult LatencyResult::avgMerge(std::vector<LatencyResult> const& bs) {
+  LatencyResult ret;
+  if (bs.empty()) {
+    return ret;
+  }
+  for (auto& b : bs) {
+    ret.p100 += b.p100;
+    ret.p95 += b.p95;
+    ret.p50 += b.p50;
+    ret.avg += b.avg;
+    ret.count += b.count;
+  }
+  ret.p100 /= bs.size();
+  ret.p95 /= bs.size();
+  ret.p50 /= bs.size();
+  ret.avg /= bs.size();
+  ret.count /= (double)bs.size();
+  return ret;
+}
+
+std::string LatencyResult::toString() const {
+  return strcat(
+      "p95=",
+      p95.count(),
+      "us",
+      " p50=",
+      p50.count(),
+      "us",
+      " avg=",
+      avg.count(),
+      "us",
+      " p100=",
+      p100.count(),
+      "us count=",
+      count);
+}
+
 class BurstStatCollector {
  public:
   bool any() const {
@@ -75,25 +150,13 @@ class BurstStatCollector {
     entries_.emplace_back(idx, TClock::now());
   }
 
-  BurstResult collect() const {
+  LatencyResult collect() const {
     using namespace std::chrono;
-    BurstResult ret;
-    if (entries_.size() == 0) {
-      return ret;
-    }
     std::vector<microseconds> durations;
     for (auto const& e : entries_) {
       durations.push_back(duration_cast<microseconds>(e.time - start_));
     }
-    std::sort(durations.begin(), durations.end());
-    ret.count = entries_.size();
-    ret.p100 = durations.back();
-    ret.p95 = durations[(int)(durations.size() * 0.95)];
-    ret.p50 = durations[durations.size() / 2];
-    ret.avg =
-        std::accumulate(durations.begin(), durations.end(), microseconds(0)) /
-        durations.size();
-    return ret;
+    return LatencyResult::from(std::move(durations));
   }
 
  private:
@@ -121,7 +184,10 @@ class IBenchmarkScenario {
   virtual bool getAction(Action& a) = 0;
   virtual void doneLast(uint64_t idx, ActionOp op) = 0;
   virtual void doneError(uint64_t idx, ActionOp op, int error) = 0;
-  virtual std::vector<BurstResult> burstResults() const {
+  virtual std::vector<LatencyResult> burstResults() const {
+    return {};
+  }
+  virtual std::optional<LatencyResult> sendLatencies() const {
     return {};
   }
 
@@ -147,6 +213,7 @@ class BenchmarkScenarioBase : public IBenchmarkScenario {
  protected:
   std::deque<Action> queue;
 };
+
 class ConnectSendLots : public BenchmarkScenarioBase {
  public:
   ConnectSendLots(uint64_t conns, uint64_t size)
@@ -155,25 +222,51 @@ class ConnectSendLots : public BenchmarkScenarioBase {
       queue.emplace_back(Action(ActionOp::Connect, c));
     }
     queue.emplace_back(Action(ActionOp::Ready, 0));
+    lastSend_.resize(conns);
+    sendTimes_.reserve(conns * 1000);
   }
 
   void doneLast(uint64_t idx, ActionOp op) override {
     switch (op) {
+      case ActionOp::Ready:
+        startTiming_ = true;
+        break;
       case ActionOp::Send:
         queue.emplace_back(ActionOp::Recv, idx, 1);
         break;
       case ActionOp::Connect:
       case ActionOp::Recv:
         queue.emplace_back(ActionOp::Send, idx, sendSize_);
+        if (startTiming_) {
+          auto const now = TClock::now();
+          auto& was = lastSend_[idx];
+          if (was.has_value() && *was < now) {
+            sendTimes_.push_back(now - *was);
+          }
+          was = now;
+        }
         break;
       default:
         break;
     };
   }
 
+  std::optional<LatencyResult> sendLatencies() const override {
+    using namespace std::chrono;
+    std::vector<microseconds> m;
+    m.reserve(sendTimes_.size());
+    for (auto const& s : sendTimes_) {
+      m.push_back(duration_cast<microseconds>(s));
+    }
+    return LatencyResult::from(std::move(m));
+  }
+
  private:
+  bool startTiming_ = false;
   uint64_t conns_;
   uint64_t sendSize_;
+  std::vector<std::optional<TClock::time_point>> lastSend_;
+  std::vector<TClock::duration> sendTimes_;
 };
 
 class ConnectSendDisconnect : public BenchmarkScenarioBase {
@@ -281,7 +374,7 @@ class BurstySend2 : public BenchmarkScenarioBase {
     vlog("doneError ", toString(op), " error=", error);
   }
 
-  std::vector<BurstResult> burstResults() const override {
+  std::vector<LatencyResult> burstResults() const override {
     vlog("burstResults size=", burstResults_.size());
     return burstResults_;
   }
@@ -291,7 +384,7 @@ class BurstySend2 : public BenchmarkScenarioBase {
   uint64_t sendSize_;
   uint64_t outstanding_ = 0;
   std::vector<uint64_t> connections_;
-  std::vector<BurstResult> burstResults_;
+  std::vector<LatencyResult> burstResults_;
   BurstStatCollector stats_;
 };
 
@@ -382,7 +475,7 @@ class BurstySend : public BenchmarkScenarioBase {
     }
   }
 
-  std::vector<BurstResult> burstResults() const override {
+  std::vector<LatencyResult> burstResults() const override {
     vlog("burstResults size=", burstResults_.size());
     return burstResults_;
   }
@@ -400,7 +493,7 @@ class BurstySend : public BenchmarkScenarioBase {
   std::chrono::microseconds period_;
   uint64_t currentPeriod_ = 0; // 0 indicates not started
   std::vector<ConnState> connections_;
-  std::vector<BurstResult> burstResults_;
+  std::vector<LatencyResult> burstResults_;
   BurstStatCollector stats_;
 };
 
@@ -963,6 +1056,7 @@ class Sender {
         res.recvErrors = recvErrors_;
         res.connectErrors = connectErrors_;
         res.connects = successConnects_;
+        res.latencies = scenario->sendLatencies().value_or(LatencyResult{});
       }
       if (state_ == SenderState::Closing && connections.empty()) {
         state_ = SenderState::Closed;
@@ -1058,7 +1152,7 @@ runSender(std::string const& test, SendOptions const& options, uint16_t port) {
 
   // std::accumulate is a bit slow
   SendResults ret;
-  for(auto& r : results) {
+  for (auto& r : results) {
     ret.mergeIn(std::move(r));
   }
   return ret;
