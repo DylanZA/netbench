@@ -467,7 +467,7 @@ class BurstySendPeriodic : public BenchmarkScenarioBase {
     while (currentPeriod_ > 0 && now > nextBurstStart_) {
       currentPeriod_++;
       nextBurstStart_ += period_;
-      if (!stats_.any()) {
+      if (stats_.any()) {
         burstResults_.push_back(stats_.collect());
       }
       stats_ = {};
