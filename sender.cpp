@@ -222,7 +222,7 @@ class ConnectSendLots : public BenchmarkScenarioBase {
       queue.emplace_back(Action(ActionOp::Connect, c));
     }
     queue.emplace_back(Action(ActionOp::Ready, 0));
-    lastSend_.resize(conns);
+    lastSend_.resize(conns + 1);
     sendTimes_.reserve(conns * 1000);
   }
 
@@ -239,7 +239,7 @@ class ConnectSendLots : public BenchmarkScenarioBase {
         queue.emplace_back(ActionOp::Send, idx, sendSize_);
         if (startTiming_) {
           auto const now = TClock::now();
-          auto& was = lastSend_[idx];
+          auto& was = lastSend_.at(idx);
           if (was.has_value() && *was < now) {
             sendTimes_.push_back(now - *was);
           }
