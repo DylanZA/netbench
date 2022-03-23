@@ -4,7 +4,7 @@ CXXFLAGS = $(CXXFLAGS_EXTRA)  -g -O2 -std=c++2a -Wall
 LDFLAGS = $(LDFLAGS_EXTRA) -g -O2 -std=c++2a -lboost_thread -lpthread -lboost_program_options -luring
 SRCS = $(wildcard *.cpp)
 OBJECTS = $(patsubst %.cpp, %.o, $(SRCS))
-TARGET = tcprecvbench
+TARGET = netbench
 
 default: $(TARGET)
 
