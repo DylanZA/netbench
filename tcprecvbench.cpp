@@ -1358,8 +1358,10 @@ desc.add_options()
 ("host", po::value(&config.send_options.host))
 ("v6", po::value(&config.send_options.ipv6))
 ("time", po::value(&config.send_options.run_seconds))
-("send_threads", po::value(&config.send_options.threads))
-("send_per_thread", po::value(&config.send_options.per_thread))
+("send_threads", po::value(&config.send_options.threads),
+  "number of sender threads")
+("send_connections_per_thread", po::value(&config.send_options.per_thread),
+ "send: number of connections made per sender thread")
 ("tx", po::value<std::vector<std::string> >()->multitoken(),
  "tx scenarios to run (can be multiple)")
 ("rx", po::value<std::vector<std::string> >()->multitoken(),
