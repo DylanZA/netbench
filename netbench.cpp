@@ -278,8 +278,6 @@ class RxStats {
 
   std::chrono::steady_clock::time_point waitStarted;
   std::chrono::steady_clock::duration totalWaited{0};
-  size_t lastBytes = 0;
-  size_t lastRequests = 0;
   uint64_t ticksPerSecond_ = sysconf(_SC_CLK_TCK);
   struct tms lastTimes_;
   clock_t lastClock_;
@@ -343,7 +341,7 @@ class NullRunner : public RunnerBase {
   explicit NullRunner(std::string const& name) : RunnerBase(name) {}
   void loop(std::atomic<bool>*) override {}
   void stop() override {}
-  void addListenSock(int fd, bool) {
+  void addListenSock(int fd, bool) override {
     close(fd);
   }
 };
