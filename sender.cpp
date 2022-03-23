@@ -324,9 +324,9 @@ TClock::time_point fromWaitParam(uint64_t val) {
   return getEpoch() + std::chrono::microseconds(val);
 }
 
-class BurstySend2 : public BenchmarkScenarioBase {
+class BurstySend : public BenchmarkScenarioBase {
  public:
-  BurstySend2(uint64_t conns, uint64_t size) : conns_(conns), sendSize_(size) {
+  BurstySend(uint64_t conns, uint64_t size) : conns_(conns), sendSize_(size) {
     for (uint64_t c = 1; c <= conns_; c++) {
       queue.emplace_back(Action(ActionOp::Connect, c));
     }
@@ -388,9 +388,12 @@ class BurstySend2 : public BenchmarkScenarioBase {
   BurstStatCollector stats_;
 };
 
-class BurstySend : public BenchmarkScenarioBase {
+class BurstySendPeriodic : public BenchmarkScenarioBase {
  public:
-  BurstySend(uint64_t conns, uint64_t size, std::chrono::microseconds period)
+  BurstySendPeriodic(
+      uint64_t conns,
+      uint64_t size,
+      std::chrono::microseconds period)
       : conns_(conns), sendSize_(size), period_(period) {
     for (uint64_t c = 1; c <= conns_; c++) {
       queue.emplace_back(Action(ActionOp::Connect, c));
@@ -506,7 +509,7 @@ std::vector<std::string> allScenarios() {
       "single_small",
       "single_medium",
       "burst",
-      "burst2",
+      "burst_periodic",
   };
 }
 
@@ -537,10 +540,10 @@ std::unique_ptr<IBenchmarkScenario> makeScenario(
   } else if (test == "single_small") {
     ret = std::make_unique<ConnectSendDisconnect>(
         options.per_thread, options.small_size);
-  } else if (test == "burst2") {
-    ret = std::make_unique<BurstySend2>(options.per_thread, options.small_size);
   } else if (test == "burst") {
-    ret = std::make_unique<BurstySend>(
+    ret = std::make_unique<BurstySend>(options.per_thread, options.small_size);
+  } else if (test == "burst_periodic") {
+    ret = std::make_unique<BurstySendPeriodic>(
         options.per_thread,
         options.small_size,
         std::chrono::microseconds(1000));
