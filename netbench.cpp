@@ -56,6 +56,7 @@ struct IoUringRxConfig : RxConfig {
   bool fixed_files = true;
   bool loop_recv = false;
   int sqe_count = 64;
+  int cqe_count = 0;
   int max_cqe_loop = 128;
   int provided_buffer_count = 8000;
   int fixed_file_count = 16000;
@@ -146,6 +147,13 @@ struct io_uring mkIoUring(IoUringRxConfig const& rx_cfg) {
   struct io_uring ring;
   memset(&params, 0, sizeof(params));
 
+  // default to 8x sqe_count as we are very happy to submit multiple sqe off one
+  // cqe (eg send,read) and this can build up quickly
+  int cqe_count =
+      rx_cfg.cqe_count <= 0 ? 8 * rx_cfg.sqe_count : rx_cfg.cqe_count;
+
+  params.flags |= IORING_SETUP_CQSIZE;
+  params.cq_entries = cqe_count;
   checkedErrno(
       io_uring_queue_init_params(rx_cfg.sqe_count, &ring, &params),
       "io_uring_queue_init_params");
@@ -211,13 +219,13 @@ class RxStats {
     }
   }
 
-  void doneLoop(size_t bytes, size_t requests) {
+  void doneLoop(size_t bytes, size_t requests, bool is_overflow = false) {
     auto const now = std::chrono::steady_clock::now();
     auto const duration = now - lastStats_;
     ++loops_;
 
     if (duration >= std::chrono::seconds(1)) {
-      doLog(bytes, requests, now, duration);
+      doLog(bytes, requests, now, duration, is_overflow);
     }
   }
 
@@ -231,7 +239,8 @@ class RxStats {
       size_t bytes,
       size_t requests,
       std::chrono::steady_clock::time_point now,
-      std::chrono::steady_clock::duration duration) {
+      std::chrono::steady_clock::duration duration,
+      bool is_overflow) {
     using namespace std::chrono;
     uint64_t const millis = duration_cast<milliseconds>(duration).count();
     double bps = ((bytes - lastBytes_) * 1000.0) / millis;
@@ -246,7 +255,7 @@ class RxStats {
           buff,
           sizeof(buff),
           "%s: rps:%6.2fk Bps:%6.2fM idle=%lums "
-          "user=%lums system=%lums wall=%lums loops=%lu",
+          "user=%lums system=%lums wall=%lums loops=%lu%s",
           name_.c_str(),
           rps / 1000.0,
           bps / 1000000.0,
@@ -254,7 +263,8 @@ class RxStats {
           getMs(lastTimes_.tms_utime, times_now.tms_utime).count(),
           getMs(lastTimes_.tms_stime, times_now.tms_stime).count(),
           getMs(lastClock_, clock_now).count(),
-          loops_);
+          loops_,
+          is_overflow ? " OVERFLOW" : "");
       if (written >= 0) {
         log(std::string_view(buff, written));
       }
@@ -940,7 +950,12 @@ struct IOUringRunner : public RunnerBase {
       }
 
       if (cfg_.print_rx_stats) {
-        rx_stats.doneLoop(bytesRx_, requestsRx_);
+        bool const is_overflow =
+            IO_URING_READ_ONCE(*ring.sq.kflags) & IORING_SQ_CQ_OVERFLOW;
+        rx_stats.doneLoop(
+            bytesRx_, requestsRx_, is_overflow
+
+        );
       }
     }
   }
@@ -1461,6 +1476,8 @@ io_uring_desc.add_options()
      ->default_value(io_uring_cfg.register_ring))
   ("sqe_count", po::value(&io_uring_cfg.sqe_count)
      ->default_value(io_uring_cfg.sqe_count))
+  ("cqe_count", po::value(&io_uring_cfg.cqe_count)
+     ->default_value(io_uring_cfg.cqe_count))
   ("provided_buffer_count", po::value(&io_uring_cfg.provided_buffer_count)
      ->default_value(io_uring_cfg.provided_buffer_count))
   ("fixed_file_count", po::value(&io_uring_cfg.fixed_file_count)

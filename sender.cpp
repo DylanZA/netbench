@@ -1059,7 +1059,6 @@ class Sender {
         res.recvErrors = recvErrors_;
         res.connectErrors = connectErrors_;
         res.connects = successConnects_;
-        res.latencies = scenario->sendLatencies().value_or(LatencyResult{});
       }
       if (state_ == SenderState::Closing && connections.empty()) {
         state_ = SenderState::Closed;
@@ -1079,6 +1078,9 @@ class Sender {
       processCompletions();
     }
 
+    // these happen here as some sends seem to take an absolute age, and we want
+    // to know about them in the stats (p100 for example)
+    res.latencies = scenario->sendLatencies().value_or(LatencyResult{});
     res.burstResults = scenario->burstResults();
     return res;
   }
