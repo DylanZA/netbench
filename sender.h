@@ -9,7 +9,7 @@
 
 struct SendOptions {
   int threads = 4;
-  int per_thread = 128;
+  int per_thread = 64;
   size_t small_size = 64;
   size_t medium_size = 1200;
   size_t large_size = 64000;

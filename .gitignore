@@ -1,4 +1,5 @@
 TARGETS
 netbench
+netbench.asan
 *.o
 .depend
