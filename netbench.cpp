@@ -1,4 +1,5 @@
 #include <boost/algorithm/string/join.hpp>
+#include <boost/align/aligned_allocator.hpp>
 #include <boost/core/noncopyable.hpp>
 #include <string_view>
 #include <thread>
@@ -361,10 +362,10 @@ class BufferProvider : private boost::noncopyable {
   static constexpr int kBgid = 1;
 
   explicit BufferProvider(size_t count, size_t size, int lowWatermark)
-      : sizePerBuffer_(size), lowWatermark_(lowWatermark) {
-    buffer_.resize(count * size);
+      : sizePerBuffer_(addAlignment(size)), lowWatermark_(lowWatermark) {
+    buffer_.resize(count * sizePerBuffer_);
     for (size_t i = 0; i < count; i++) {
-      buffers_.push_back(buffer_.data() + i * size);
+      buffers_.push_back(buffer_.data() + i * sizePerBuffer_);
     }
     toProvide_.reserve(128);
     toProvide2_.reserve(128);
@@ -468,8 +469,15 @@ class BufferProvider : private boost::noncopyable {
   }
 
  private:
+  static constexpr int kAlignment = 16;
+
+  size_t addAlignment(size_t n) {
+    return kAlignment * ((n + kAlignment - 1) / kAlignment);
+  }
+
   size_t sizePerBuffer_;
-  std::vector<char> buffer_;
+  std::vector<char, boost::alignment::aligned_allocator<char, kAlignment>>
+      buffer_;
   std::vector<char*> buffers_;
   struct Range {
     explicit Range(int idx, int count = 1) : start(idx), count(count) {}
