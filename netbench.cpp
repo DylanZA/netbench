@@ -413,17 +413,10 @@ class BufferProvider : private boost::noncopyable {
       }
     }
     toProvide_.swap(toProvide2_);
-    // log("merged ",
-    //     merged,
-    //     " was ",
-    //     toProvide2_.size(),
-    //     " now ",
-    //     toProvide_.size());
   }
 
   void returnIndex(int i) {
     if (toProvide_.empty()) {
-      // log("return ", i, " was empty");
       toProvide_.emplace_back(i);
     } else if (toProvide_.back().merge(i)) {
       // yay, nothing to do
@@ -445,23 +438,9 @@ class BufferProvider : private boost::noncopyable {
     io_uring_prep_provide_buffers(
         sqe, buffers_[r.start], sizePerBuffer_, r.count, kBgid, r.start);
     sqe->flags |= IOSQE_CQE_SKIP_SUCCESS;
-    // log("recycle ",
-    //     r.start,
-    //     " count=",
-    //     r.count,
-    //     " to=",
-    //     toProvideCount_,
-    //     " size=",
-    //     toProvide_.size());
     toProvideCount_ -= r.count;
     toProvide_.pop_back();
-    if (toProvide_.size() == 0) {
-      // URGH
-      if (toProvideCount_ != 0) {
-        log("huh was ", toProvideCount_, " but wanted 0");
-      }
-      toProvideCount_ = 0;
-    }
+    assert(toProvide_.size() != 0 || toProvideCount_ == 0);
   }
 
   char const* getData(int i) const {
@@ -475,10 +454,6 @@ class BufferProvider : private boost::noncopyable {
     return kAlignment * ((n + kAlignment - 1) / kAlignment);
   }
 
-  size_t sizePerBuffer_;
-  std::vector<char, boost::alignment::aligned_allocator<char, kAlignment>>
-      buffer_;
-  std::vector<char*> buffers_;
   struct Range {
     explicit Range(int idx, int count = 1) : start(idx), count(count) {}
     int start;
@@ -510,6 +485,11 @@ class BufferProvider : private boost::noncopyable {
       }
     }
   };
+
+  size_t sizePerBuffer_;
+  std::vector<char, boost::alignment::aligned_allocator<char, kAlignment>>
+      buffer_;
+  std::vector<char*> buffers_;
   ssize_t toProvideCount_ = 0;
   int lowWatermark_;
   std::vector<Range> toProvide_;
