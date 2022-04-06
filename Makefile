@@ -34,5 +34,5 @@ $(SANITIZED_TARGET): $(SRCS) $(HEADERS)
 sanitized: $(SANITIZED_TARGET)
 
 check: $(SANITIZED_TARGET) $(TARGET)
-	bash ./check.sh $(SANITIZED_TARGET)
-	bash ./check.sh $(TARGET)
+	bash ./check.sh ./$(SANITIZED_TARGET)
+	bash ./check.sh ./$(TARGET)
