@@ -564,10 +564,10 @@ struct BasicSock {
 
   void addClose(struct io_uring_sqe* sqe) {
     closed_ = true;
-    io_uring_prep_close(sqe, fd_);
-    if (kUseFixedFiles) {
-      sqe->flags |= IOSQE_FIXED_FILE;
-    }
+    if (kUseFixedFiles)
+      io_uring_prep_close_direct(sqe, fd_);
+    else
+      io_uring_prep_close(sqe, fd_);
   }
 
   int didRead(size_t size, BufferProvider& provider, struct io_uring_cqe* cqe) {
