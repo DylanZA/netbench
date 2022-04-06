@@ -500,17 +500,25 @@ static constexpr int kUseBufferProviderFlag = 1;
 static constexpr int kUseFixedFilesFlag = 2;
 static constexpr int kLoopRecvFlag = 4;
 
+int providedBufferIdx(struct io_uring_cqe* cqe) {
+  return cqe->flags >> 16;
+}
+
 template <size_t ReadSize = 4096, size_t Flags = 0>
 struct BasicSock {
   static constexpr bool kUseBufferProvider = Flags & kUseBufferProviderFlag;
   static constexpr bool kUseFixedFiles = Flags & kUseFixedFilesFlag;
   static constexpr bool kShouldLoop = Flags & kLoopRecvFlag;
-  explicit BasicSock(int fd) : fd(fd) {}
+  explicit BasicSock(int fd) : fd_(fd) {}
 
   ~BasicSock() {
     if (!closed_) {
       log("socket not closed at destruct");
     }
+  }
+
+  int fd() const {
+    return fd_;
   }
 
   uint32_t peekSend() {
@@ -523,7 +531,7 @@ struct BasicSock {
     if (len > ReadSize) {
       die("too big send");
     }
-    io_uring_prep_send(sqe, fd, &buff[0], len, 0);
+    io_uring_prep_send(sqe, fd_, &buff[0], len, 0);
     if (kUseFixedFiles) {
       sqe->flags |= IOSQE_FIXED_FILE;
     }
@@ -533,11 +541,11 @@ struct BasicSock {
 
   void addRead(struct io_uring_sqe* sqe, BufferProvider& provider) {
     if (kUseBufferProvider) {
-      io_uring_prep_recv(sqe, fd, NULL, provider.sizePerBuffer(), 0);
+      io_uring_prep_recv(sqe, fd_, NULL, provider.sizePerBuffer(), 0);
       sqe->flags |= IOSQE_BUFFER_SELECT;
       sqe->buf_group = BufferProvider::kBgid;
     } else {
-      io_uring_prep_recv(sqe, fd, &buff[0], sizeof(buff), 0);
+      io_uring_prep_recv(sqe, fd_, &buff[0], sizeof(buff), 0);
     }
 
     if (kUseFixedFiles) {
@@ -545,16 +553,21 @@ struct BasicSock {
     }
   }
 
+  bool closing() const {
+    return closed_;
+  }
+
   void doClose() {
     closed_ = true;
-    ::close(fd);
+    ::close(fd_);
   }
 
   void addClose(struct io_uring_sqe* sqe) {
     closed_ = true;
-    io_uring_prep_close(sqe, fd);
-    sqe->flags |= IOSQE_FIXED_FILE;
-    io_uring_sqe_set_data(sqe, 0);
+    io_uring_prep_close(sqe, fd_);
+    if (kUseFixedFiles) {
+      sqe->flags |= IOSQE_FIXED_FILE;
+    }
   }
 
   int didRead(size_t size, BufferProvider& provider, struct io_uring_cqe* cqe) {
@@ -562,13 +575,13 @@ struct BasicSock {
     int res = size;
     int recycleBufferIdx = -1;
     if (kUseBufferProvider) {
-      recycleBufferIdx = cqe->flags >> 16;
+      recycleBufferIdx = providedBufferIdx(cqe);
       didRead(res, provider, recycleBufferIdx);
     } else {
       didRead(res);
     }
     while (kShouldLoop && res == (int)size) {
-      res = recv(this->fd, buff, sizeof(buff), MSG_NOSIGNAL);
+      res = recv(this->fd_, buff, sizeof(buff), MSG_NOSIGNAL);
       if (res > 0) {
         didRead(res);
       }
@@ -590,7 +603,7 @@ struct BasicSock {
     do_send += parser.consume(b, n);
   }
 
-  int fd;
+  int fd_;
   ProtocolParser parser;
   uint32_t do_send = 0;
   bool closed_ = false;
@@ -652,6 +665,8 @@ struct IOUringRunner : public RunnerBase {
       checkedErrno(
           io_uring_register_files(&ring, files.data(), files.size()),
           "io_uring_register_files");
+      for (int i = rx_cfg.fixed_file_count - 1; i >= 0; i--)
+        acceptFdPool_.push_back(i);
     }
   }
 
@@ -688,7 +703,7 @@ struct IOUringRunner : public RunnerBase {
   static constexpr int kAccept = 1;
   static constexpr int kRead = 2;
   static constexpr int kWrite = 3;
-  static constexpr int kIgnore = 0;
+  static constexpr int kOther = 0;
 
   void addListenSock(int fd, bool v6) override {
     listeners_++;
@@ -798,6 +813,20 @@ struct IOUringRunner : public RunnerBase {
     }
   }
 
+  void processClose(struct io_uring_cqe* cqe, TSock* sock) {
+    int res = cqe->res;
+    if (!res || res == -EBADF) {
+      if (TSock::kUseFixedFiles) {
+        // recycle index
+        acceptFdPool_.push_back(sock->fd());
+      }
+    } else {
+      // cannot recycle
+      log("unable to close fd, ret=", res);
+    }
+    delete sock;
+  }
+
   void processRead(struct io_uring_cqe* cqe) {
     int amount = cqe->res;
     TSock* sock = untag<TSock>(cqe->user_data);
@@ -825,16 +854,18 @@ struct IOUringRunner : public RunnerBase {
           log("unexpected read: ", amount, " delete ", sock);
         }
       }
-
+      if (cqe->res == 0 && TSock::kUseBufferProvider) {
+        buffers_.returnIndex(providedBufferIdx(cqe));
+      }
       if (TSock::kUseFixedFiles) {
         auto* sqe = get_sqe();
         sock->addClose(sqe);
-        io_uring_sqe_set_data(sqe, NULL);
+        io_uring_sqe_set_data(sqe, tag(sock, kOther));
       } else {
         sock->doClose();
+        delete sock;
+        delSock();
       }
-      delete sock;
-      delSock();
     }
   }
 
@@ -856,7 +887,14 @@ struct IOUringRunner : public RunnerBase {
           log("bad socket write ", cqe->res);
         }
         break;
-      case kIgnore:
+      case kOther:
+        if (cqe->user_data) {
+          TSock* sock = untag<TSock>(cqe->user_data);
+          if (sock->closing()) {
+            // assume this was a close
+            processClose(cqe, sock);
+          }
+        }
         break;
       default:
         if (cqe->user_data == LIBURING_UDATA_TIMEOUT) {
@@ -956,10 +994,11 @@ struct IOUringRunner : public RunnerBase {
   }
 
   int nextFdIdx() {
-    int ret = nextFdIdx_++;
-    if (ret >= rxCfg_.fixed_file_count) {
-      die("too many files, limit is ", ret);
+    if (acceptFdPool_.empty()) {
+      die("no fd for accept");
     }
+    int ret = acceptFdPool_.back();
+    acceptFdPool_.pop_back();
     return ret;
   }
 
@@ -996,7 +1035,7 @@ struct IOUringRunner : public RunnerBase {
   std::vector<struct io_uring_cqe*> cqes_;
   int listeners_ = 0;
   uint32_t enobuffCount_ = 0;
-  int nextFdIdx_ = 0;
+  std::vector<int> acceptFdPool_;
 };
 
 static constexpr uint32_t kSocket = 0;
