@@ -35,6 +35,36 @@ namespace po = boost::program_options;
  *
  */
 
+#define __NR_io_uring_register 427
+
+static inline int ____sys_io_uring_register(
+    int fd,
+    unsigned opcode,
+    const void* arg,
+    unsigned nr_args) {
+  int ret;
+
+  ret = syscall(__NR_io_uring_register, fd, opcode, arg, nr_args);
+  return (ret < 0) ? -errno : ret;
+}
+
+int ____io_uring_register_files_update_flag(
+    struct io_uring* ring,
+    unsigned off,
+    const int* files,
+    unsigned nr_files,
+    unsigned flag) {
+  struct io_uring_rsrc_update2 up = {
+      .offset = off,
+      .data = (unsigned long)files,
+      .nr = nr_files,
+      .resv2 = flag,
+  };
+
+  return ____sys_io_uring_register(
+      ring->ring_fd, IORING_REGISTER_FILES_UPDATE2, &up, sizeof(up));
+}
+
 std::atomic<bool> globalShouldShutdown{false};
 void intHandler(int dummy) {
   if (globalShouldShutdown.load()) {
@@ -55,6 +85,7 @@ struct IoUringRxConfig : RxConfig {
   bool register_ring = true;
   bool provide_buffers = true;
   bool fixed_files = true;
+  bool fixed_files_no_accept = false;
   bool loop_recv = false;
   int sqe_count = 64;
   int cqe_count = 0;
@@ -499,6 +530,7 @@ class BufferProvider : private boost::noncopyable {
 static constexpr int kUseBufferProviderFlag = 1;
 static constexpr int kUseFixedFilesFlag = 2;
 static constexpr int kLoopRecvFlag = 4;
+static constexpr int kFixedFilesNoDirectAcceptFlag = 8;
 
 int providedBufferIdx(struct io_uring_cqe* cqe) {
   return cqe->flags >> 16;
@@ -508,7 +540,11 @@ template <size_t ReadSize = 4096, size_t Flags = 0>
 struct BasicSock {
   static constexpr bool kUseBufferProvider = Flags & kUseBufferProviderFlag;
   static constexpr bool kUseFixedFiles = Flags & kUseFixedFilesFlag;
+  static constexpr bool kUseFixedFilesDirectAccept =
+      Flags & kUseFixedFilesFlag && !(Flags & kFixedFilesNoDirectAcceptFlag);
   static constexpr bool kShouldLoop = Flags & kLoopRecvFlag;
+  static constexpr bool kFixedFilesNoDirectAccept =
+      (Flags & kUseFixedFilesFlag) && (Flags & kFixedFilesNoDirectAcceptFlag);
   explicit BasicSock(int fd) : fd_(fd) {}
 
   ~BasicSock() {
@@ -721,7 +757,7 @@ struct IOUringRunner : public RunnerBase {
       ls->client_len = sizeof(ls->addr);
       addr = (struct sockaddr*)&ls->addr;
     }
-    if (TSock::kUseFixedFiles) {
+    if (TSock::kUseFixedFilesDirectAccept) {
       if (ls->nextAcceptIdx >= 0) {
         die("only allowed one accept at a time");
       }
@@ -764,7 +800,15 @@ struct IOUringRunner : public RunnerBase {
     ListenSock* ls = untag<ListenSock>(cqe->user_data);
     if (fd >= 0) {
       int used_fd = fd;
-      if (TSock::kUseFixedFiles) {
+      if (TSock::kFixedFilesNoDirectAccept) {
+        used_fd = nextFdIdx();
+        log("using idx ", used_fd);
+        checkedErrno(
+            ____io_uring_register_files_update_flag(&ring, used_fd, &fd, 1, 1),
+            "update idx to ",
+            used_fd);
+
+      } else if (TSock::kUseFixedFilesDirectAccept) {
         if (fd > 0) {
           die("trying to use fixed files, but got given an actual fd. "
               "implies that this kernel does not support this feature");
@@ -1341,7 +1385,8 @@ Receiver makeIoUringRx(
   std::unique_ptr<RunnerBase> runner;
   size_t flags = (rx_cfg.provide_buffers ? kUseBufferProviderFlag : 0) |
       (rx_cfg.fixed_files ? kUseFixedFilesFlag : 0) |
-      (rx_cfg.loop_recv ? kLoopRecvFlag : 0);
+      (rx_cfg.loop_recv ? kLoopRecvFlag : 0) |
+      (rx_cfg.fixed_files_no_accept ? kFixedFilesNoDirectAcceptFlag : 0);
 
   ((mbIoUringRxFactory<PossibleFlag>(
        cfg, rx_cfg, strcat("io_uring port=", port), flags, runner)),
@@ -1493,6 +1538,8 @@ io_uring_desc.add_options()
      ->default_value(io_uring_cfg.provide_buffers))
   ("fixed_files",  po::value(&io_uring_cfg.fixed_files)
      ->default_value(io_uring_cfg.fixed_files))
+  ("fixed_files_no_accept",  po::value(&io_uring_cfg.fixed_files_no_accept)
+     ->default_value(io_uring_cfg.fixed_files_no_accept))
   ("loop_recv", po::value(&io_uring_cfg.loop_recv)
      ->default_value(io_uring_cfg.loop_recv))
   ("max_cqe_loop",  po::value(&io_uring_cfg.max_cqe_loop)
@@ -1532,7 +1579,7 @@ io_uring_desc.add_options()
   switch (engine) {
     case RxEngine::IoUring:
       return [io_uring_cfg](Config const& cfg) -> Receiver {
-        return makeIoUringRx(cfg, io_uring_cfg, std::make_index_sequence<16>{});
+        return makeIoUringRx(cfg, io_uring_cfg, std::make_index_sequence<32>{});
       };
     case RxEngine::Epoll:
       return [epoll_cfg](Config const& cfg) -> Receiver {
