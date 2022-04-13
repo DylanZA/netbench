@@ -61,3 +61,8 @@ run tests to a prepared host. the host has 2 ports (eg io_uring and epoll) so us
 
 run a test to a IPv4 prepared host
 ` $ ./netbench --v6 0 --tx small --tx burst --client_only 1 --use_port 10001 --host $(dig +short a foo)`
+
+## Note
+
+By default it uses IPv6, in order to use IPv4 set the v6 flag to 0:
+` $ ./netbench --v6 0`
