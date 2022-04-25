@@ -173,17 +173,22 @@ struct ProtocolParser {
     while (n > 0) {
       so_far += n;
       if (!is_reading) {
-        uint32_t size_buff_add = std::min<uint32_t>(n, 4 - size_buff_have);
-        memcpy(size_buff + size_buff_have, data, size_buff_add);
-        size_buff_have += size_buff_add;
-        if (size_buff_have >= 4) {
-          memcpy(&is_reading, size_buff, 4);
+        if (likely(n >= sizeof(is_reading) && size_buff_have == 0)) {
+          size_buff_have = sizeof(is_reading);
+          memcpy(&is_reading, data, sizeof(is_reading));
+        } else {
+          uint32_t size_buff_add = std::min<uint32_t>(n, sizeof(is_reading) - size_buff_have);
+          memcpy(size_buff + size_buff_have, data, size_buff_add);
+          size_buff_have += size_buff_add;
+          if (size_buff_have >= sizeof(is_reading)) {
+            memcpy(&is_reading, size_buff, sizeof(is_reading));
+          }
         }
       }
       // vlog("consume ", n, " is_reading=", is_reading);
-      if (is_reading && so_far >= is_reading + 4) {
+      if (is_reading && so_far >= is_reading + sizeof(is_reading)) {
         data += n;
-        n = so_far - (is_reading + 4);
+        n = so_far - (is_reading + sizeof(is_reading));
         so_far = size_buff_have = is_reading = 0;
         ret++;
       } else {
@@ -194,8 +199,8 @@ struct ProtocolParser {
   }
 
   uint32_t size_buff_have = 0;
-  char size_buff[4];
   uint32_t is_reading = 0;
+  char size_buff[sizeof(is_reading)];
   uint32_t so_far = 0;
 };
 
@@ -452,7 +457,7 @@ class BufferProvider : private boost::noncopyable {
   }
 
  private:
-  static constexpr int kAlignment = 16;
+  static constexpr int kAlignment = 32;
 
   size_t addAlignment(size_t n) {
     return kAlignment * ((n + kAlignment - 1) / kAlignment);
