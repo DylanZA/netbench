@@ -17,6 +17,9 @@ float logTime();
 void setVerbose();
 bool isVerbose();
 
+#define likely(x)       __builtin_expect((x),1)
+#define unlikely(x)     __builtin_expect((x),0)
+
 namespace {
 
 template <typename... T>
@@ -42,7 +45,7 @@ inline void log(const T&... vals) {
 
 template <typename... T>
 inline void _vlog(const T&... vals) {
-  if (!isVerbose())
+  if (likely(!isVerbose()))
     return;
   log(vals...);
 }

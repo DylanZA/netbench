@@ -411,7 +411,12 @@ class BufferProvider : private boost::noncopyable {
       }
     }
     toProvide_.swap(toProvide2_);
-    vlog("was ", was, " now ", toProvide_.size());
+    if (unlikely(isVerbose())) {
+      vlog("compact() was ", was, " now ", toProvide_.size());
+      for (auto const& t : toProvide_) {
+        vlog("...", t.start, " count=", t.count);
+      }
+    }
   }
 
   void returnIndex(uint16_t i) {
@@ -858,7 +863,7 @@ struct IOUringRunner : public RunnerBase {
       didRead(amount);
       addRead(sock);
     } else if (amount <= 0) {
-      if (cqe->res == -ENOBUFS) {
+      if (unlikely(cqe->res == -ENOBUFS)) {
         log("not enough buffers, but will just requeue. so far have ",
             ++enobuffCount_,
             "state: can provide=",
@@ -869,7 +874,7 @@ struct IOUringRunner : public RunnerBase {
         return;
       }
       if (cqe->res < 0 && !stopping) {
-        if (cqe->res != -ECONNRESET) {
+        if (unlikely(cqe->res != -ECONNRESET)) {
           log("unexpected read: ", amount, " delete ", sock);
         }
       }
