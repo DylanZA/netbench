@@ -61,7 +61,7 @@ struct IoUringRxConfig : RxConfig {
   int max_cqe_loop = 128;
   int provided_buffer_count = 8000;
   int fixed_file_count = 16000;
-  int provided_buffer_low_watermark = 2000;
+  int provided_buffer_low_watermark = -1;
   int provided_buffer_compact = 1;
 
   std::string const toString() const {
@@ -397,25 +397,24 @@ class BufferProvider : private boost::noncopyable {
     if (toProvide_.size() <= 1) {
       return;
     }
+    auto was = toProvide_.size();
     std::sort(
         toProvide_.begin(), toProvide_.end(), [](auto const& a, auto const& b) {
-          return a.start < b.start;
+          return a.sortable < b.sortable;
         });
-    int merged = 0;
     toProvide2_.clear();
     toProvide2_.push_back(toProvide_[0]);
     for (size_t i = 1; i < toProvide_.size(); i++) {
       auto const& p = toProvide_[i];
       if (!toProvide2_.back().merge(p)) {
         toProvide2_.push_back(p);
-      } else {
-        ++merged;
       }
     }
     toProvide_.swap(toProvide2_);
+    vlog("was ", was, " now ", toProvide_.size());
   }
 
-  void returnIndex(int i) {
+  void returnIndex(uint16_t i) {
     if (toProvide_.empty()) {
       toProvide_.emplace_back(i);
     } else if (toProvide_.back().merge(i)) {
@@ -443,7 +442,7 @@ class BufferProvider : private boost::noncopyable {
     assert(toProvide_.size() != 0 || toProvideCount_ == 0);
   }
 
-  char const* getData(int i) const {
+  char const* getData(uint16_t i) const {
     return buffers_.at(i);
   }
 
@@ -455,11 +454,27 @@ class BufferProvider : private boost::noncopyable {
   }
 
   struct Range {
-    explicit Range(int idx, int count = 1) : start(idx), count(count) {}
-    int start;
-    int count = 1;
+#if __BYTE_ORDER__ == __ORDER_LITTLE_ENDIAN__
+    explicit Range(uint16_t idx, uint16_t count = 1)
+        : count(count), start(idx) {}
+#else
+    explicit Range(uint16_t idx, uint16_t count = 1)
+        : start(idx), count(count) {}
+#endif
+    union {
+      struct {
+#if __BYTE_ORDER__ == __ORDER_LITTLE_ENDIAN__
+        uint16_t count;
+        uint16_t start;
+#else
+        uint16_t start;
+        uint16_t count;
+#endif
+      };
+      uint32_t sortable; // big endian might need to swap these around
+    };
 
-    bool merge(int idx) {
+    bool merge(uint16_t idx) {
       if (idx == start - 1) {
         start = idx;
         count++;
@@ -845,7 +860,11 @@ struct IOUringRunner : public RunnerBase {
     } else if (amount <= 0) {
       if (cqe->res == -ENOBUFS) {
         log("not enough buffers, but will just requeue. so far have ",
-            ++enobuffCount_);
+            ++enobuffCount_,
+            "state: can provide=",
+            buffers_.toProvideCount(),
+            " need=",
+            buffers_.needsToProvide());
         addRead(sock);
         return;
       }
@@ -1528,6 +1547,12 @@ io_uring_desc.add_options()
   };
 
   simpleParse(*used_desc, splits);
+
+  if (io_uring_cfg.provided_buffer_low_watermark < 0) {
+    // default to quarter unless explicitly told
+    io_uring_cfg.provided_buffer_low_watermark =
+        io_uring_cfg.provided_buffer_count / 4;
+  }
 
   switch (engine) {
     case RxEngine::IoUring:
