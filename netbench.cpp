@@ -401,6 +401,12 @@ class BufferProvider : private boost::noncopyable {
   void compact() {
     if (toProvide_.size() <= 1) {
       return;
+    } else if (toProvide_.size() == 2) {
+      // actually a common case due to the way the kernel internals work
+      if (toProvide_[0].merge(toProvide_[1])) {
+        toProvide_.pop_back();
+      }
+      return;
     }
     auto was = toProvide_.size();
     std::sort(
