@@ -1,6 +1,7 @@
 #include <boost/algorithm/string/join.hpp>
 #include <boost/align/aligned_allocator.hpp>
 #include <boost/core/noncopyable.hpp>
+#include <numeric>
 #include <string_view>
 #include <thread>
 #include <unordered_set>
@@ -1411,6 +1412,7 @@ Receiver makeIoUringRx(
 Config parse(int argc, char** argv) {
   Config config;
   po::options_description desc;
+  int runs = 1;
   // clang-format off
 desc.add_options()
 ("help", "produce help message")
@@ -1422,6 +1424,8 @@ desc.add_options()
  "do not tx locally, wait for it")
 ("client_only", po::value(&config.client_only),
  "do not rx locally, only send requests")
+("runs", po::value(&runs)->default_value(runs),
+  "how many times to run the test")
 ("host", po::value(&config.send_options.host))
 ("v6", po::value(&config.send_options.ipv6))
 ("time", po::value(&config.send_options.run_seconds))
@@ -1487,6 +1491,17 @@ desc.add_options()
 
   if (config.client_only) {
     config.rx.clear();
+  }
+
+  if (runs <= 0) {
+    die("bad runs");
+  } else if (runs > 1) {
+    auto const rx = config.rx;
+    auto const tx = config.tx;
+    for (int i = 1; i < runs; i++) {
+      config.rx.insert(config.rx.end(), rx.begin(), rx.end());
+      config.tx.insert(config.tx.end(), tx.begin(), tx.end());
+    }
   }
 
   // validations:
@@ -1598,6 +1613,55 @@ io_uring_desc.add_options()
   return {};
 }
 
+template <class T>
+struct SimpleAggregate {
+  explicit SimpleAggregate(std::vector<T>&& vals) {
+    std::sort(vals.begin(), vals.end());
+    avg = std::accumulate(vals.begin(), vals.end(), T(0)) / vals.size();
+    p50 = vals[vals.size() / 2];
+    p100 = vals.back();
+  }
+
+  template <class Formatter>
+  std::string toString(Formatter f) const {
+    return strcat("p50=", f(p50), " avg=", f(avg), " p100=", f(p100));
+  }
+  T avg;
+  T p50;
+  T p100;
+};
+
+struct AggregateResults {
+  AggregateResults(SimpleAggregate<double> pps, SimpleAggregate<double> bps)
+      : packetsPerSecond(std::move(pps)), bytesPerSecond(std::move(bps)) {}
+
+  std::string toString() const {
+    return strcat(
+        "packetsPerSecond={",
+        packetsPerSecond.toString(
+            [](double x) { return strcat(x / 1000, "k"); }),
+        "} bytesPerSecond={",
+        bytesPerSecond.toString(
+            [](double x) { return strcat(x / 1000000, "M"); }),
+        "}");
+  }
+
+  SimpleAggregate<double> packetsPerSecond;
+  SimpleAggregate<double> bytesPerSecond;
+};
+
+AggregateResults aggregateResults(std::vector<SendResults> const& results) {
+  std::vector<double> pps;
+  std::vector<double> bps;
+  for (auto const& r : results) {
+    pps.push_back(r.packetsPerSecond);
+    bps.push_back(r.bytesPerSecond);
+  }
+  return AggregateResults{
+      SimpleAggregate<double>{std::move(pps)},
+      SimpleAggregate<double>{std::move(bps)}};
+}
+
 int main(int argc, char** argv) {
   Config const cfg = parse(argc, argv);
   signal(SIGINT, intHandler);
@@ -1623,7 +1687,7 @@ int main(int argc, char** argv) {
     }
   }
 
-  std::vector<std::pair<std::string, std::string>> results;
+  std::vector<std::pair<std::string, SendResults>> results;
   if (cfg.tx.size()) {
     log("sending using ",
         cfg.send_options.threads,
@@ -1649,13 +1713,25 @@ int main(int argc, char** argv) {
         rcv_thread.join();
         log("...done receiver");
         results.emplace_back(
-            strcat(tx, "_", rcv.name, "_", rcv.rxCfg), res.toString());
+            strcat(tx, "_", rcv.name, "_", rcv.rxCfg), std::move(res));
       }
     }
-    for (auto const& r : results) {
+    std::unordered_map<std::string, std::vector<SendResults>> to_agg;
+    for (auto& r : results) {
       log(r.first);
-      log(std::string(30, ' '), r.second);
+      log(std::string(30, ' '), r.second.toString());
+      to_agg[r.first].push_back(std::move(r.second));
     }
+
+    for (auto& kv : to_agg) {
+      if (kv.second.size() <= 1) {
+        continue;
+      }
+      log("aggregated_", kv.first);
+      log(std::string(30, ' '),
+          aggregateResults(std::move(kv.second)).toString());
+    }
+
   } else {
     // no built in sender mode
     std::atomic<bool> should_shutdown{false};
