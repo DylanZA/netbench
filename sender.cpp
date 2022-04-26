@@ -11,6 +11,7 @@
 #include <netdb.h>
 #include <netinet/in.h>
 #include <stdlib.h>
+#include <sys/epoll.h>
 #include <sys/socket.h>
 #include <sys/types.h>
 
@@ -613,7 +614,13 @@ static int parse_ip6_addr(const char* str_addr, struct sockaddr_in6* sockaddr) {
   return -1;
 }
 
-class Sender {
+class ISender {
+ public:
+  virtual ~ISender() = default;
+  virtual SendResults go() = 0;
+};
+
+class Sender : public ISender {
  public:
   Sender(
       std::string const& test,
@@ -1041,7 +1048,7 @@ class Sender {
     return sqe;
   }
 
-  SendResults go() {
+  SendResults go() override {
     SendResults res;
     while (state_ != SenderState::Closed) {
       if (state_ == SenderState::Running && TClock::now() > end_) {
@@ -1131,6 +1138,230 @@ class Sender {
   size_t successConnects_ = 0;
 };
 
+void getAddress(
+    SendOptions const& options,
+    uint16_t port,
+    struct sockaddr_storage* addr,
+    socklen_t* addrLen) {
+  std::string dest = options.host;
+  if (options.ipv6) {
+    struct sockaddr_in6* addr6 = (struct sockaddr_in6*)addr;
+    *addrLen = sizeof(*addr6);
+    memset(addr6, 0, sizeof(*addr6));
+    if (dest.empty()) {
+      dest = "::1";
+    }
+    if (parse_ip6_addr(dest.c_str(), addr6)) {
+      die("ipv6 parse error: ", dest);
+    }
+    addr6->sin6_family = PF_INET6;
+    addr6->sin6_port = htons(port);
+  } else {
+    struct sockaddr_in* addr4 = (struct sockaddr_in*)addr;
+    *addrLen = sizeof(*addr4);
+    memset(addr4, 0, sizeof(*addr4));
+    addr4->sin_family = AF_INET;
+    addr4->sin_port = htons(port);
+    if (dest.empty()) {
+      dest = "127.0.1.1";
+    }
+    if (inet_pton(AF_INET, dest.c_str(), &(addr4->sin_addr)) != 1) {
+      die("ipv4 parse error:", dest);
+    }
+  }
+}
+
+struct EpollConnection {
+  explicit EpollConnection(int fd) : fd(fd) {}
+  EpollConnection(EpollConnection const&) = delete;
+  EpollConnection& operator=(EpollConnection const&) = delete;
+  ~EpollConnection() {
+    if (fd >= 0) {
+      close(fd);
+    }
+  }
+
+  void sent(TClock::time_point n) {
+    last = n;
+  }
+
+  std::chrono::microseconds recv(TClock::time_point n) {
+    return std::chrono::duration_cast<std::chrono::microseconds>(n - last);
+  }
+
+  int fd = -1;
+  TClock::time_point last;
+  std::vector<std::chrono::microseconds> latencies;
+};
+
+class EpollSender : public ISender {
+ public:
+  std::vector<char> buff;
+  EpollSender(
+      SendOptions const& options,
+      uint16_t port,
+      boost::barrier& ready_barrier)
+      : cfg_(options), ready_barrier(ready_barrier) {
+    getAddress(options, port, &addr_, &addrLen_);
+    latencies_.reserve(cfg_.per_thread * 10000);
+    epollFd_ = checkedErrno(epoll_create(2048), "epoll_create");
+
+    // prep buffer
+    buff.resize(sizeof(uint32_t) + options.small_size);
+    uint32_t len = options.small_size;
+    memcpy(buff.data(), &len, sizeof(len));
+  }
+
+  ~EpollSender() {
+    close(epollFd_);
+  }
+
+  bool addConnection() {
+    int type = cfg_.ipv6 ? PF_INET6 : PF_INET;
+    int fd = checkedErrno(socket(type, SOCK_STREAM, 0));
+    auto conn = std::make_unique<EpollConnection>(fd);
+    if (cfg_.zero_send_buf) {
+      doSetSockOpt<int>(conn->fd, SOL_SOCKET, SO_SNDBUF, 0);
+    }
+    checkedErrno(
+        ::connect(conn->fd, (const struct sockaddr*)&addr_, addrLen_),
+        "sender: epoll_connect");
+    struct epoll_event ev;
+    memset(&ev, 0, sizeof(ev));
+    ev.events = EPOLLIN;
+    ev.data.u32 = connections_.size();
+    checkedErrno(
+        epoll_ctl(epollFd_, EPOLL_CTL_ADD, conn->fd, &ev), "sender: epoll_add");
+    connections_.push_back(std::move(conn));
+    return true;
+  }
+
+  void doConnect() {
+    for (int i = 0; i < cfg_.per_thread; i++) {
+      if (addConnection()) {
+        successConnects_++;
+      } else {
+        connectErrors_++;
+        maybeTooManyConnectErrors();
+      }
+    }
+  }
+
+  void doSend(int i) {
+    EpollConnection* conn = connections_[i].get();
+    if (!conn) {
+      log("cannot send on ", i);
+    }
+    char* at = buff.data();
+    size_t len = buff.size();
+    do {
+      int ret = ::send(conn->fd, at, len, MSG_NOSIGNAL);
+      if (ret >= len) {
+        break;
+      } else if (ret >= 0) {
+        len -= ret;
+      } else {
+        int e = errno;
+        sendErrors_++;
+        if (e != EINTR) {
+          die("send error ", e);
+        }
+      }
+    } while (len);
+    conn->sent(TClock::now());
+    ++packetsSent_;
+    bytesSent_ += buff.size();
+  }
+
+  bool doRead(int i) {
+    EpollConnection* conn = connections_[i].get();
+    if (!conn) {
+      log("cannot recv on ", i);
+      return false;
+    }
+    std::array<char, 100> buff;
+    int e;
+    do {
+      int ret = ::recv(conn->fd, buff.data(), buff.size(), 0);
+      if (ret > 0) {
+        latencies_.push_back(conn->recv(TClock::now()));
+        return true;
+      } else if (ret == 0) {
+        connections_[i].reset();
+        log("connection ", i, " closed");
+      } else {
+        e = errno;
+        ++recvErrors_;
+      }
+    } while (e == EINTR);
+    die("recv error ", e);
+    return false;
+  }
+
+  SendResults go() override {
+    SendResults res;
+    doConnect();
+    ready_barrier.wait();
+    end_ = TClock::now() +
+        std::chrono::milliseconds(
+               static_cast<uint64_t>(cfg_.run_seconds * 1000.0));
+    for (int i = 0; i < connections_.size(); i++) {
+      doSend(i);
+    }
+    std::array<struct epoll_event, 1024> epoll_events;
+    while (TClock::now() < end_) {
+      int nevents = checkedErrno(
+          epoll_wait(epollFd_, epoll_events.data(), epoll_events.size(), 100),
+          "epoll_wait");
+      for (int i = 0; i < nevents; i++) {
+        if (epoll_events[i].events & EPOLLIN) {
+          if (doRead(i)) {
+            doSend(i);
+          }
+        }
+      }
+    }
+
+    // make the results now, so it doesnt include cleanup
+    res = {};
+    res.packetsPerSecond = packetsSent_ / cfg_.run_seconds;
+    res.bytesPerSecond = bytesSent_ / cfg_.run_seconds;
+    res.sendErrors = sendErrors_;
+    res.recvErrors = recvErrors_;
+    res.connectErrors = connectErrors_;
+    res.connects = successConnects_;
+    res.latencies = LatencyResult::from(std::move(latencies_));
+    // res.burstResults = scenario->burstResults();
+    return res;
+  }
+
+ private:
+  void maybeTooManyConnectErrors() {
+    // bail out early
+    if (connectErrors_ >= 100 && connectErrors_ > 100 * successConnects_) {
+      die("too many connection errors: ",
+          connectErrors_,
+          " vs successes: ",
+          successConnects_);
+    }
+  }
+
+  SendOptions const cfg_;
+  boost::barrier& ready_barrier;
+  struct sockaddr_storage addr_;
+  socklen_t addrLen_;
+  TClock::time_point end_;
+  int epollFd_;
+  std::vector<std::unique_ptr<EpollConnection>> connections_;
+  std::vector<std::chrono::microseconds> latencies_;
+  size_t bytesSent_ = 0;
+  size_t packetsSent_ = 0;
+  size_t connectErrors_ = 0;
+  size_t sendErrors_ = 0;
+  size_t recvErrors_ = 0;
+  size_t successConnects_ = 0;
+};
+
 SendResults
 runSender(std::string const& test, SendOptions const& options, uint16_t port) {
   SendBuffers buffers{options};
@@ -1139,8 +1370,13 @@ runSender(std::string const& test, SendOptions const& options, uint16_t port) {
   boost::barrier ready_barrier{(unsigned int)options.threads + 1};
   results.resize(options.threads);
   for (int i = 0; i < options.threads; i++) {
-    auto sender =
-        std::make_unique<Sender>(test, options, buffers, port, ready_barrier);
+    std::unique_ptr<ISender> sender;
+    if (test == "epoll") {
+      sender = std::make_unique<EpollSender>(options, port, ready_barrier);
+    } else {
+      sender =
+          std::make_unique<Sender>(test, options, buffers, port, ready_barrier);
+    }
     threads.push_back(std::thread{wrapThread(
         strcat("send", i), [i, s = std::move(sender), r = &results[i]]() {
           *r = s->go();
