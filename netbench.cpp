@@ -177,7 +177,8 @@ struct ProtocolParser {
           size_buff_have = sizeof(is_reading);
           memcpy(&is_reading, data, sizeof(is_reading));
         } else {
-          uint32_t size_buff_add = std::min<uint32_t>(n, sizeof(is_reading) - size_buff_have);
+          uint32_t size_buff_add =
+              std::min<uint32_t>(n, sizeof(is_reading) - size_buff_have);
           memcpy(size_buff + size_buff_have, data, size_buff_add);
           size_buff_have += size_buff_add;
           if (size_buff_have >= sizeof(is_reading)) {
@@ -1416,10 +1417,12 @@ desc.add_options()
 ("host", po::value(&config.send_options.host))
 ("v6", po::value(&config.send_options.ipv6))
 ("time", po::value(&config.send_options.run_seconds))
-("send_threads", po::value(&config.send_options.threads),
+("send_threads", po::value(&config.send_options.threads)
+   ->default_value(config.send_options.threads),
   "number of sender threads")
-("send_connections_per_thread", po::value(&config.send_options.per_thread),
- "send: number of connections made per sender thread")
+("send_connections_per_thread", po::value(&config.send_options.per_thread)
+   ->default_value(config.send_options.per_thread),
+   "send: number of connections made per sender thread")
 ("tx", po::value<std::vector<std::string> >()->multitoken(),
  "tx scenarios to run (can be multiple)")
 ("rx", po::value<std::vector<std::string> >()->multitoken(),
