@@ -12,6 +12,7 @@
 #include <netinet/in.h>
 #include <stdlib.h>
 #include <sys/epoll.h>
+#include <sys/fcntl.h>
 #include <sys/socket.h>
 #include <sys/types.h>
 
@@ -1190,6 +1191,8 @@ struct EpollConnection {
   }
 
   int fd = -1;
+  char* toSendAt = nullptr;
+  size_t toSend = 0;
   TClock::time_point last;
   std::vector<std::chrono::microseconds> latencies;
 };
@@ -1200,15 +1203,16 @@ class EpollSender : public ISender {
   EpollSender(
       SendOptions const& options,
       uint16_t port,
-      boost::barrier& ready_barrier)
+      boost::barrier& ready_barrier,
+      uint32_t size)
       : cfg_(options), ready_barrier(ready_barrier) {
     getAddress(options, port, &addr_, &addrLen_);
     latencies_.reserve(cfg_.per_thread * 10000);
     epollFd_ = checkedErrno(epoll_create(2048), "epoll_create");
 
     // prep buffer
-    buff.resize(sizeof(uint32_t) + options.small_size);
-    uint32_t len = options.small_size;
+    buff.resize(sizeof(uint32_t) + size);
+    uint32_t len = size;
     memcpy(buff.data(), &len, sizeof(len));
   }
 
@@ -1226,6 +1230,14 @@ class EpollSender : public ISender {
     checkedErrno(
         ::connect(conn->fd, (const struct sockaddr*)&addr_, addrLen_),
         "sender: epoll_connect");
+
+    // now make it non blocking:
+    {
+      int flags = checkedErrno(fcntl(conn->fd, F_GETFL, 0));
+      flags |= O_NONBLOCK;
+      checkedErrno(fcntl(conn->fd, F_SETFL, flags));
+    }
+
     struct epoll_event ev;
     memset(&ev, 0, sizeof(ev));
     ev.events = EPOLLIN;
@@ -1234,6 +1246,16 @@ class EpollSender : public ISender {
         epoll_ctl(epollFd_, EPOLL_CTL_ADD, conn->fd, &ev), "sender: epoll_add");
     connections_.push_back(std::move(conn));
     return true;
+  }
+
+  void modEpoll(EpollConnection* ep, int i, int events) {
+    struct epoll_event ev;
+    memset(&ev, 0, sizeof(ev));
+    ev.events = events;
+    ev.data.u64 = i;
+    checkedErrno(
+        epoll_ctl(epollFd_, EPOLL_CTL_MOD, ep->fd, &ev),
+        "sender: epoll_add_write");
   }
 
   void doConnect() {
@@ -1247,27 +1269,39 @@ class EpollSender : public ISender {
     }
   }
 
-  void doSend(int i) {
+  void doSend(int i, bool from_poll) {
     EpollConnection* conn = connections_[i].get();
     if (!conn) {
       log("cannot send on ", i);
     }
-    char* at = buff.data();
-    size_t len = buff.size();
+    if (!from_poll) {
+      conn->toSendAt = buff.data();
+      conn->toSend = buff.size();
+    }
     do {
-      int ret = ::send(conn->fd, at, len, MSG_NOSIGNAL);
-      if (ret >= len) {
-        break;
-      } else if (ret >= 0) {
-        len -= ret;
+      int ret = ::send(conn->fd, conn->toSendAt, conn->toSend, MSG_NOSIGNAL);
+      if (ret >= 0) {
+        if (ret >= conn->toSend) {
+          break;
+        }
+        conn->toSend -= ret;
       } else {
         int e = errno;
+        if (e == EAGAIN) {
+          if (!from_poll) {
+            modEpoll(conn, i, EPOLLIN | EPOLLOUT);
+          }
+          return;
+        }
         sendErrors_++;
         if (e != EINTR) {
           die("send error ", e);
         }
       }
-    } while (len);
+    } while (conn->toSend);
+    if (from_poll) {
+      modEpoll(conn, i, EPOLLIN);
+    }
     conn->sent(TClock::now());
     ++packetsSent_;
     bytesSent_ += buff.size();
@@ -1291,6 +1325,9 @@ class EpollSender : public ISender {
         log("connection ", i, " closed");
       } else {
         e = errno;
+        if (e == EAGAIN) {
+          return false;
+        }
         ++recvErrors_;
       }
     } while (e == EINTR);
@@ -1306,7 +1343,7 @@ class EpollSender : public ISender {
         std::chrono::milliseconds(
                static_cast<uint64_t>(cfg_.run_seconds * 1000.0));
     for (int i = 0; i < connections_.size(); i++) {
-      doSend(i);
+      doSend(i, false);
     }
     std::array<struct epoll_event, 1024> epoll_events;
     while (TClock::now() < end_) {
@@ -1316,8 +1353,10 @@ class EpollSender : public ISender {
       for (int i = 0; i < nevents; i++) {
         if (epoll_events[i].events & EPOLLIN) {
           if (doRead(i)) {
-            doSend(i);
+            doSend(i, false);
           }
+        } else if (epoll_events[i].events & EPOLLOUT) {
+          doSend(i, true);
         }
       }
     }
@@ -1372,7 +1411,11 @@ runSender(std::string const& test, SendOptions const& options, uint16_t port) {
   for (int i = 0; i < options.threads; i++) {
     std::unique_ptr<ISender> sender;
     if (test == "epoll") {
-      sender = std::make_unique<EpollSender>(options, port, ready_barrier);
+      sender = std::make_unique<EpollSender>(
+          options, port, ready_barrier, options.small_size);
+    } else if (test == "epoll_large") {
+      sender = std::make_unique<EpollSender>(
+          options, port, ready_barrier, options.large_size);
     } else {
       sender =
           std::make_unique<Sender>(test, options, buffers, port, ready_barrier);
