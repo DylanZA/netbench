@@ -21,6 +21,10 @@
 
 namespace po = boost::program_options;
 
+namespace {
+static constexpr uint32_t __IORING_SETUP_COOP_TASKRUN = (1U << 8);
+}
+
 /*
  * Network benchmark tool.
  *
@@ -56,6 +60,7 @@ struct IoUringRxConfig : RxConfig {
   bool provide_buffers = true;
   bool fixed_files = true;
   bool loop_recv = false;
+  bool no_ipi = false;
   int sqe_count = 64;
   int cqe_count = 0;
   int max_cqe_loop = 128;
@@ -155,6 +160,9 @@ struct io_uring mkIoUring(IoUringRxConfig const& rx_cfg) {
 
   params.flags |= IORING_SETUP_CQSIZE;
   params.cq_entries = cqe_count;
+  if (rx_cfg.no_ipi) {
+    params.flags |= __IORING_SETUP_COOP_TASKRUN;
+  }
   checkedErrno(
       io_uring_queue_init_params(rx_cfg.sqe_count, &ring, &params),
       "io_uring_queue_init_params");
@@ -1533,6 +1541,8 @@ io_uring_desc.add_options()
      ->default_value(io_uring_cfg.fixed_files))
   ("loop_recv", po::value(&io_uring_cfg.loop_recv)
      ->default_value(io_uring_cfg.loop_recv))
+  ("no_ipi", po::value(&io_uring_cfg.no_ipi)
+     ->default_value(io_uring_cfg.no_ipi))
   ("max_cqe_loop",  po::value(&io_uring_cfg.max_cqe_loop)
      ->default_value(io_uring_cfg.max_cqe_loop))
   ("supports_nonblock_accept",  po::value(&io_uring_cfg.supports_nonblock_accept)
