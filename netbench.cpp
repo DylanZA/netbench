@@ -1716,11 +1716,29 @@ int main(int argc, char** argv) {
             strcat(tx, "_", rcv.name, "_", rcv.rxCfg), std::move(res));
       }
     }
-    std::unordered_map<std::string, std::vector<SendResults>> to_agg;
+
     for (auto& r : results) {
       log(r.first);
       log(std::string(30, ' '), r.second.toString());
-      to_agg[r.first].push_back(std::move(r.second));
+    }
+
+    // build up to_agg but do it in insertion order of results
+    // hence the nasty but probably not a big deal std::find_if
+    std::vector<std::pair<std::string, std::vector<SendResults>>> to_agg;
+    for (auto& r : results) {
+      auto it = std::find_if(to_agg.begin(), to_agg.end(), [&](auto const& x) {
+        return x.first == r.first;
+      });
+      if (it == to_agg.end()) {
+        to_agg
+            .emplace_back(
+                std::piecewise_construct,
+                std::make_tuple(r.first),
+                std::make_tuple())
+            .second.push_back(std::move(r.second));
+      } else {
+        it->second.push_back(std::move(r.second));
+      }
     }
 
     for (auto& kv : to_agg) {
