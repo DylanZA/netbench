@@ -64,7 +64,7 @@ struct IoUringRxConfig : RxConfig {
   bool no_ipi = false;
   int sqe_count = 64;
   int cqe_count = 0;
-  int max_cqe_loop = 128;
+  int max_cqe_loop = 256 * 32;
   int provided_buffer_count = 8000;
   int fixed_file_count = 16000;
   int provided_buffer_low_watermark = -1;
@@ -72,6 +72,10 @@ struct IoUringRxConfig : RxConfig {
 
   std::string const toString() const {
     // only give the important options:
+    auto is_default = [this](auto IoUringRxConfig::*x) {
+      IoUringRxConfig base;
+      return this->*x == base.*x;
+    };
     return strcat(
         "fixed_files=",
         fixed_files ? strcat("1 (count=", fixed_file_count, ")") : strcat("0"),
@@ -84,7 +88,16 @@ struct IoUringRxConfig : RxConfig {
                               " compact=",
                               provided_buffer_compact,
                               ")")
-                        : strcat("0"));
+                        : strcat("0"),
+        is_default(&IoUringRxConfig::sqe_count)
+            ? ""
+            : strcat(" sqe_count=", sqe_count),
+        is_default(&IoUringRxConfig::cqe_count)
+            ? ""
+            : strcat(" cqe_count=", cqe_count),
+        is_default(&IoUringRxConfig::max_cqe_loop)
+            ? ""
+            : strcat(" max_cqe_loop=", max_cqe_loop));
   }
 };
 
@@ -980,7 +993,7 @@ struct IOUringRunner : public RunnerBase {
     }
 
     while (socks() || !stopping) {
-      provideBuffers(false /* maybe we should force? */);
+      provideBuffers(false);
       submit();
 
       rx_stats.startWait();
@@ -1014,7 +1027,8 @@ struct IOUringRunner : public RunnerBase {
           processCqe(cqes_[i]);
         }
         io_uring_cq_advance(&ring, cqe_count);
-      } while (cqe_count > 0 && ++loop_count < rxCfg_.max_cqe_loop);
+        loop_count += cqe_count;
+      } while (cqe_count > 0 && loop_count < rxCfg_.max_cqe_loop);
 
       if (!cqe_count && stopping) {
         vlog("processed ", cqe_count, " socks()=", socks());
