@@ -26,6 +26,7 @@ namespace po = boost::program_options;
 namespace {
 static constexpr uint32_t __IORING_SETUP_COOP_TASKRUN = (1U << 8);
 
+static constexpr int __NR_io_uring_enter = 426;
 static constexpr int __NR_io_uring_register = 427;
 static inline int ____sys_io_uring_register(
     int fd,
@@ -35,6 +36,20 @@ static inline int ____sys_io_uring_register(
   int ret;
 
   ret = syscall(__NR_io_uring_register, fd, opcode, arg, nr_args);
+  return (ret < 0) ? -errno : ret;
+}
+
+static inline int ____sys_io_uring_enter2(
+    int fd,
+    unsigned to_submit,
+    unsigned min_complete,
+    unsigned flags,
+    sigset_t* sig,
+    int sz) {
+  int ret;
+
+  ret =
+      syscall(__NR_io_uring_enter, fd, to_submit, min_complete, flags, sig, sz);
   return (ret < 0) ? -errno : ret;
 }
 
@@ -272,8 +287,12 @@ class RxStats {
     auto const duration = now - lastStats_;
     ++loops_;
 
+    if (is_overflow) {
+      ++overflows_;
+    }
+
     if (duration >= std::chrono::seconds(1)) {
-      doLog(bytes, requests, now, duration, is_overflow);
+      doLog(bytes, requests, now, duration);
     }
   }
 
@@ -287,8 +306,7 @@ class RxStats {
       size_t bytes,
       size_t requests,
       std::chrono::steady_clock::time_point now,
-      std::chrono::steady_clock::duration duration,
-      bool is_overflow) {
+      std::chrono::steady_clock::duration duration) {
     using namespace std::chrono;
     uint64_t const millis = duration_cast<milliseconds>(duration).count();
     double bps = ((bytes - lastBytes_) * 1000.0) / millis;
@@ -303,7 +321,7 @@ class RxStats {
           buff,
           sizeof(buff),
           "%s: rps:%6.2fk Bps:%6.2fM idle=%lums "
-          "user=%lums system=%lums wall=%lums loops=%lu%s",
+          "user=%lums system=%lums wall=%lums loops=%lu overflows=%lu",
           name_.c_str(),
           rps / 1000.0,
           bps / 1000000.0,
@@ -312,12 +330,12 @@ class RxStats {
           getMs(lastTimes_.tms_stime, times_now.tms_stime).count(),
           getMs(lastClock_, clock_now).count(),
           loops_,
-          is_overflow ? " OVERFLOW" : "");
+          overflows_);
       if (written >= 0) {
         log(std::string_view(buff, written));
       }
     }
-    loops_ = 0;
+    loops_ = overflows_ = 0;
     idle_ = steady_clock::duration{0};
     lastClock_ = clock_now;
     lastTimes_ = times_now;
@@ -340,6 +358,7 @@ class RxStats {
   struct tms lastTimes_;
   clock_t lastClock_;
   uint64_t loops_ = 0;
+  uint64_t overflows_ = 0;
 
   std::chrono::steady_clock::time_point waitStarted_;
   std::chrono::steady_clock::duration idle_{0};
@@ -1172,6 +1191,36 @@ struct IOUringRunner : public RunnerBase {
     }
   }
 
+  int submitAndWait1(struct io_uring_cqe** cqe, struct __kernel_timespec* ts) {
+    int got = checkedErrno(
+        io_uring_submit_and_wait_timeout(&ring, cqe, 1, ts, NULL),
+        "submit_and_wait_timeout");
+    if (got >= 0) {
+      // io_uring_submit_and_wait_timeout actually returns 0
+      expected = 0;
+      return 0;
+    } else if (got == -ETIME || got == -EINTR) {
+      return 0;
+    } else {
+      die("submit_and_wait_timeout failed with ", got);
+      return got;
+    }
+  }
+
+  bool isOverflow() const {
+    return IO_URING_READ_ONCE(*ring.sq.kflags) & IORING_SQ_CQ_OVERFLOW;
+  }
+
+  // todo: replace with io_uring_flush_overflow when it lands
+  int flushOverflow() const {
+    int flags = IORING_ENTER_GETEVENTS;
+    if (rxCfg_.register_ring) {
+      flags |= IORING_ENTER_REGISTERED_RING;
+    }
+    return ____sys_io_uring_enter2(
+        ring.enter_ring_fd, 0, 0, flags, NULL, _NSIG / 8);
+  }
+
   void loop(std::atomic<bool>* should_shutdown) override {
     RxStats rx_stats{name()};
     struct __kernel_timespec timeout;
@@ -1183,18 +1232,31 @@ struct IOUringRunner : public RunnerBase {
     }
 
     while (socks() || !stopping) {
+      bool const was_overflow = isOverflow();
       provideBuffers(false);
-      submit();
 
       rx_stats.startWait();
-      int wait_res = checkedErrno(
-          io_uring_wait_cqe_timeout(&ring, &cqes_[0], &timeout),
-          "wait_cqe_timeout");
-      rx_stats.doneWait();
-      if (!wait_res) {
+
+      if (was_overflow) {
+        flushOverflow();
         rx_stats.doneWait();
-        processCqe(cqes_[0]);
-        io_uring_cqe_seen(&ring, cqes_[0]);
+      } else if (expected) {
+        cqes_[0] = nullptr;
+        submitAndWait1(&cqes_[0], &timeout);
+        rx_stats.doneWait();
+        // cqe might not be set here if we submitted
+      } else {
+        int wait_res = checkedErrno(
+            io_uring_wait_cqe_timeout(&ring, &cqes_[0], &timeout),
+            "wait_cqe_timeout");
+        rx_stats.doneWait();
+
+        // can trust here that cqe will be set
+        if (!wait_res && cqes_[0]) {
+          rx_stats.doneWait();
+          processCqe(cqes_[0]);
+          io_uring_cqe_seen(&ring, cqes_[0]);
+        }
       }
 
       if (should_shutdown->load() || globalShouldShutdown.load()) {
@@ -1225,12 +1287,7 @@ struct IOUringRunner : public RunnerBase {
       }
 
       if (cfg_.print_rx_stats) {
-        bool const is_overflow =
-            IO_URING_READ_ONCE(*ring.sq.kflags) & IORING_SQ_CQ_OVERFLOW;
-        rx_stats.doneLoop(
-            bytesRx_, requestsRx_, is_overflow
-
-        );
+        rx_stats.doneLoop(bytesRx_, requestsRx_, was_overflow);
       }
     }
   }
