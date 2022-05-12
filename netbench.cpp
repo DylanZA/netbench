@@ -90,7 +90,6 @@ struct IoUringRxConfig : RxConfig {
   int provide_buffers = 1;
   bool fixed_files = true;
   bool loop_recv = false;
-  bool no_ipi = false;
   int sqe_count = 64;
   int cqe_count = 0;
   int max_cqe_loop = 256 * 32;
@@ -128,8 +127,7 @@ struct IoUringRxConfig : RxConfig {
             : strcat(" cqe_count=", cqe_count),
         is_default(&IoUringRxConfig::max_cqe_loop)
             ? ""
-            : strcat(" max_cqe_loop=", max_cqe_loop),
-        is_default(&IoUringRxConfig::no_ipi) ? "" : strcat(" no_ipi=", no_ipi));
+            : strcat(" max_cqe_loop=", max_cqe_loop));
   }
 };
 
@@ -208,14 +206,18 @@ struct io_uring mkIoUring(IoUringRxConfig const& rx_cfg) {
 
   params.flags |= IORING_SETUP_CQSIZE;
   params.cq_entries = cqe_count;
-  if (rx_cfg.no_ipi) {
-    params.flags |= __IORING_SETUP_COOP_TASKRUN;
+  params.flags |= __IORING_SETUP_COOP_TASKRUN;
+  int ret = io_uring_queue_init_params(rx_cfg.sqe_count, &ring, &params);
+  if (ret < 0) {
+    log("trying init again without COOP_TASKRUN");
+    params.flags = params.flags & (~__IORING_SETUP_COOP_TASKRUN);
+    checkedErrno(
+        io_uring_queue_init_params(rx_cfg.sqe_count, &ring, &params),
+        "io_uring_queue_init_params");
   }
-  checkedErrno(
-      io_uring_queue_init_params(rx_cfg.sqe_count, &ring, &params),
-      "io_uring_queue_init_params");
+
   if (rx_cfg.register_ring) {
-    io_uring_register_ring_fd(&ring);
+    checkedErrno(io_uring_register_ring_fd(&ring), "register ring fd");
   }
   return ring;
 }
@@ -1819,8 +1821,6 @@ io_uring_desc.add_options()
      ->default_value(io_uring_cfg.fixed_files))
   ("loop_recv", po::value(&io_uring_cfg.loop_recv)
      ->default_value(io_uring_cfg.loop_recv))
-  ("no_ipi", po::value(&io_uring_cfg.no_ipi)
-     ->default_value(io_uring_cfg.no_ipi))
   ("max_cqe_loop",  po::value(&io_uring_cfg.max_cqe_loop)
      ->default_value(io_uring_cfg.max_cqe_loop))
   ("supports_nonblock_accept",  po::value(&io_uring_cfg.supports_nonblock_accept)
