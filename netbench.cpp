@@ -113,7 +113,8 @@ struct IoUringRxConfig : RxConfig {
             : strcat(" cqe_count=", cqe_count),
         is_default(&IoUringRxConfig::max_cqe_loop)
             ? ""
-            : strcat(" max_cqe_loop=", max_cqe_loop));
+            : strcat(" max_cqe_loop=", max_cqe_loop),
+        is_default(&IoUringRxConfig::no_ipi) ? "" : strcat(" no_ipi=", no_ipi));
   }
 };
 
