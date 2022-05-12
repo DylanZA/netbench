@@ -14,6 +14,7 @@
 #include <netinet/in.h>
 #include <stdlib.h>
 #include <sys/epoll.h>
+#include <sys/mman.h>
 #include <sys/socket.h>
 #include <sys/times.h>
 
@@ -24,7 +25,20 @@ namespace po = boost::program_options;
 
 namespace {
 static constexpr uint32_t __IORING_SETUP_COOP_TASKRUN = (1U << 8);
+
+static constexpr int __NR_io_uring_register = 427;
+static inline int ____sys_io_uring_register(
+    int fd,
+    unsigned opcode,
+    const void* arg,
+    unsigned nr_args) {
+  int ret;
+
+  ret = syscall(__NR_io_uring_register, fd, opcode, arg, nr_args);
+  return (ret < 0) ? -errno : ret;
 }
+
+} // namespace
 
 /*
  * Network benchmark tool.
@@ -58,7 +72,7 @@ struct RxConfig {
 struct IoUringRxConfig : RxConfig {
   bool supports_nonblock_accept = false;
   bool register_ring = true;
-  bool provide_buffers = true;
+  int provide_buffers = 1;
   bool fixed_files = true;
   bool loop_recv = false;
   bool no_ipi = false;
@@ -81,7 +95,9 @@ struct IoUringRxConfig : RxConfig {
         fixed_files ? strcat("1 (count=", fixed_file_count, ")") : strcat("0"),
         " provide_buffers=",
         provide_buffers ? strcat(
-                              "1 (count=",
+                              "v=",
+                              provide_buffers,
+                              " (count=",
                               provided_buffer_count,
                               " refill=",
                               provided_buffer_low_watermark,
@@ -171,6 +187,8 @@ struct io_uring mkIoUring(IoUringRxConfig const& rx_cfg) {
   // cqe (eg send,read) and this can build up quickly
   int cqe_count =
       rx_cfg.cqe_count <= 0 ? 8 * rx_cfg.sqe_count : rx_cfg.cqe_count;
+
+  params.flags |= IORING_SETUP_SUBMIT_ALL;
 
   params.flags |= IORING_SETUP_CQSIZE;
   params.cq_entries = cqe_count;
@@ -385,12 +403,14 @@ class NullRunner : public RunnerBase {
   }
 };
 
-class BufferProvider : private boost::noncopyable {
+class BufferProviderV1 : private boost::noncopyable {
  public:
   static constexpr int kBgid = 1;
 
-  explicit BufferProvider(size_t count, size_t size, int lowWatermark)
-      : sizePerBuffer_(addAlignment(size)), lowWatermark_(lowWatermark) {
+  explicit BufferProviderV1(IoUringRxConfig const& rx_cfg)
+      : sizePerBuffer_(addAlignment(rx_cfg.recv_size)),
+        lowWatermark_(rx_cfg.provided_buffer_low_watermark) {
+    auto count = rx_cfg.provided_buffer_count;
     buffer_.resize(count * sizePerBuffer_);
     for (size_t i = 0; i < count; i++) {
       buffers_.push_back(buffer_.data() + i * sizePerBuffer_);
@@ -420,6 +440,8 @@ class BufferProvider : private boost::noncopyable {
   bool needsToProvide() const {
     return toProvideCount_ > lowWatermark_;
   }
+
+  void initialRegister(struct io_uring*) {}
 
   void compact() {
     if (toProvide_.size() <= 1) {
@@ -550,9 +572,168 @@ class BufferProvider : private boost::noncopyable {
   std::vector<Range> toProvide2_;
 };
 
+class BufferProviderV2 : private boost::noncopyable {
+ public:
+  static constexpr int kBgid = 1;
+
+  explicit BufferProviderV2(IoUringRxConfig const& rx_cfg)
+      : sizePerBuffer_(addAlignment(rx_cfg.recv_size)) {
+    auto count = rx_cfg.provided_buffer_count;
+    buffer_.resize(count * sizePerBuffer_);
+    for (size_t i = 0; i < count; i++) {
+      buffers_.push_back(buffer_.data() + i * sizePerBuffer_);
+    }
+    ringSize_ = 1;
+    ringMask_ = 0;
+    while (ringSize_ < count) {
+      ringSize_ *= 2;
+      ringMask_ = (ringMask_ << 1) | 1;
+    }
+
+    ringMemSize_ = (ringSize_ + 1) * sizeof(entry_union);
+    // we have to mmap in order to get page aligned data
+    if (void* ring_mmapped = mmap(
+            NULL,
+            ringMemSize_,
+            PROT_READ | PROT_WRITE,
+            MAP_ANONYMOUS | MAP_PRIVATE,
+            -1,
+            0);
+        ring_mmapped == MAP_FAILED) {
+      auto errnoCopy = errno;
+      die("unable to map ring: ", errnoCopy, strerror(errnoCopy));
+    } else {
+      ring_ = (entry_union*)ring_mmapped;
+    }
+    ring_[0].head = 0;
+    for (size_t i = 0; i < count; i++) {
+      ring_[i + 1].buf = {};
+    }
+    if (count >= std::numeric_limits<uint16_t>::max()) {
+      die("buffer count too large: ", count);
+    }
+    for (uint16_t i = 0; i < count; i++) {
+      returnIndex(i);
+    }
+    vlog(
+        "ring address=",
+        ring_,
+        " ring size=",
+        ringSize_,
+        " buffer count=",
+        count,
+        " ring_mask=",
+        ringMask_,
+        " head now ",
+        nextHeadCached_ - 1);
+  }
+
+  ~BufferProviderV2() {
+    munmap(ring_, ringMemSize_);
+  }
+
+  size_t count() const {
+    return buffers_.size();
+  }
+
+  size_t sizePerBuffer() const {
+    return sizePerBuffer_;
+  }
+
+  size_t toProvideCount() const {
+    return 0;
+  }
+
+  bool canProvide() const {
+    return false;
+  }
+
+  bool needsToProvide() const {
+    return false;
+  }
+
+  void compact() {}
+
+  void returnIndex(uint16_t i) {
+    auto& next = ring_[1 + (nextHeadCached_ & ringMask_)].buf;
+    next.bid = i;
+    next.addr = (__u64)getData(i);
+
+    // can we assume kernel doesnt touch len or resv?
+    next.len = sizePerBuffer_;
+    next.resv = 0;
+
+    ring_[0].head.store(nextHeadCached_, std::memory_order_release);
+    nextHeadCached_++;
+  }
+
+  void provide(struct io_uring_sqe*) {}
+
+  char const* getData(uint16_t i) const {
+    return buffers_.at(i);
+  }
+
+  void initialRegister(struct io_uring* ring) {
+    __io_uring_buf_reg reg;
+    memset(&reg, 0, sizeof(reg));
+    reg.ring_addr = (__u64)ring_;
+    reg.ring_entries = ringSize_;
+    reg.bgid = kBgid;
+    static constexpr int __IORING_REGISTER_PBUF_RING = 22;
+
+    auto head_was = ring_[0].head.load();
+    checkedErrno(
+        ____sys_io_uring_register(
+            ring->ring_fd, __IORING_REGISTER_PBUF_RING, (void*)&reg, 1),
+        "register pbuf");
+
+    // silly io_uring, clobbering our data:
+    ring_[0].head.store(head_was);
+  }
+
+ private:
+  static constexpr int kAlignment = 32;
+  struct __io_uring_buf_reg {
+    __u64 ring_addr;
+    __u32 ring_entries;
+    __u16 bgid;
+    __u16 pad;
+    __u64 resv[3];
+  };
+  struct __io_uring_buf {
+    __u64 addr;
+    __u32 len;
+    __u16 bid;
+    __u16 resv;
+  };
+
+  union entry_union {
+    entry_union() : buf() {}
+    entry_union(entry_union const& r) : buf(r.buf) {}
+    std::atomic<__u32> head;
+    struct __io_uring_buf buf;
+  };
+
+  size_t addAlignment(size_t n) {
+    return kAlignment * ((n + kAlignment - 1) / kAlignment);
+  }
+
+  size_t sizePerBuffer_;
+  std::vector<char, boost::alignment::aligned_allocator<char, kAlignment>>
+      buffer_;
+  std::vector<char*> buffers_;
+  uint32_t nextHeadCached_ = 0;
+  size_t ringMemSize_;
+  uint32_t ringSize_;
+  uint32_t ringMask_;
+
+  entry_union* ring_;
+};
+
 static constexpr int kUseBufferProviderFlag = 1;
-static constexpr int kUseFixedFilesFlag = 2;
-static constexpr int kLoopRecvFlag = 4;
+static constexpr int kUseBufferProviderV2Flag = 2;
+static constexpr int kUseFixedFilesFlag = 4;
+static constexpr int kLoopRecvFlag = 8;
 
 int providedBufferIdx(struct io_uring_cqe* cqe) {
   return cqe->flags >> 16;
@@ -560,9 +741,18 @@ int providedBufferIdx(struct io_uring_cqe* cqe) {
 
 template <size_t ReadSize = 4096, size_t Flags = 0>
 struct BasicSock {
-  static constexpr bool kUseBufferProvider = Flags & kUseBufferProviderFlag;
+  static constexpr int kUseBufferProviderVersion =
+      (Flags & kUseBufferProviderV2Flag) ? 2
+      : (Flags & kUseBufferProviderFlag) ? 1
+                                         : 0;
   static constexpr bool kUseFixedFiles = Flags & kUseFixedFilesFlag;
   static constexpr bool kShouldLoop = Flags & kLoopRecvFlag;
+
+  using TBufferProvider = std::conditional_t<
+      kUseBufferProviderVersion == 2,
+      BufferProviderV2,
+      BufferProviderV1>;
+
   explicit BasicSock(int fd) : fd_(fd) {}
 
   ~BasicSock() {
@@ -593,11 +783,11 @@ struct BasicSock {
     do_send -= std::min(len, do_send);
   }
 
-  void addRead(struct io_uring_sqe* sqe, BufferProvider& provider) {
-    if (kUseBufferProvider) {
+  void addRead(struct io_uring_sqe* sqe, TBufferProvider& provider) {
+    if (kUseBufferProviderVersion) {
       io_uring_prep_recv(sqe, fd_, NULL, provider.sizePerBuffer(), 0);
       sqe->flags |= IOSQE_BUFFER_SELECT;
-      sqe->buf_group = BufferProvider::kBgid;
+      sqe->buf_group = TBufferProvider::kBgid;
     } else {
       io_uring_prep_recv(sqe, fd_, &buff[0], sizeof(buff), 0);
     }
@@ -624,11 +814,14 @@ struct BasicSock {
       io_uring_prep_close(sqe, fd_);
   }
 
-  int didRead(size_t size, BufferProvider& provider, struct io_uring_cqe* cqe) {
+  int didRead(
+      size_t size,
+      TBufferProvider& provider,
+      struct io_uring_cqe* cqe) {
     // pull remaining data
     int res = size;
     int recycleBufferIdx = -1;
-    if (kUseBufferProvider) {
+    if (kUseBufferProviderVersion) {
       recycleBufferIdx = providedBufferIdx(cqe);
       didRead(res, provider, recycleBufferIdx);
     } else {
@@ -649,7 +842,7 @@ struct BasicSock {
     didRead(buff, n);
   }
 
-  void didRead(size_t n, BufferProvider& provider, int idx) {
+  void didRead(size_t n, TBufferProvider& provider, int idx) {
     // read from a provided buffer
     didRead(provider.getData(idx), n);
   }
@@ -698,10 +891,7 @@ struct IOUringRunner : public RunnerBase {
         cfg_(cfg),
         rxCfg_(rx_cfg),
         ring(mkIoUring(rx_cfg)),
-        buffers_(
-            rx_cfg.provided_buffer_count,
-            rx_cfg.recv_size,
-            rx_cfg.provided_buffer_low_watermark) {
+        buffers_(rx_cfg) {
     if (TSock::kUseFixedFiles && TSock::kShouldLoop) {
       die("can't have fixed files and looping, "
           "we don't have the fd to call recv() !");
@@ -709,7 +899,8 @@ struct IOUringRunner : public RunnerBase {
 
     cqes_.resize(rx_cfg.max_events);
 
-    if (TSock::kUseBufferProvider) {
+    if (TSock::kUseBufferProviderVersion) {
+      buffers_.initialRegister(&ring);
       provideBuffers(true);
       submit();
     }
@@ -737,7 +928,7 @@ struct IOUringRunner : public RunnerBase {
   }
 
   void provideBuffers(bool force) {
-    if (!TSock::kUseBufferProvider) {
+    if (TSock::kUseBufferProviderVersion != 1) {
       return;
     }
     if (!(force || buffers_.needsToProvide())) {
@@ -912,7 +1103,7 @@ struct IOUringRunner : public RunnerBase {
           log("unexpected read: ", amount, " delete ", sock);
         }
       }
-      if (cqe->res == 0 && TSock::kUseBufferProvider) {
+      if (cqe->res == 0 && TSock::kUseBufferProviderVersion) {
         buffers_.returnIndex(providedBufferIdx(cqe));
       }
       if (TSock::kUseFixedFiles) {
@@ -967,17 +1158,15 @@ struct IOUringRunner : public RunnerBase {
     while (expected) {
       int got = io_uring_submit(&ring);
       if (got != expected) {
-        // log("sender: expected to submit ", expected, " but did ", got);
         if (got == 0) {
           if (stopping) {
             // assume some kind of cancel issue?
             expected--;
           } else {
-            die("literally sent nothing, wanted ", expected);
+            die("literally submitted nothing, wanted ", expected);
           }
         }
       }
-      // log("submitted ", got);
       expected -= got;
     }
   }
@@ -1089,7 +1278,8 @@ struct IOUringRunner : public RunnerBase {
   int expected = 0;
   bool stopping = false;
   struct io_uring ring;
-  BufferProvider buffers_;
+
+  typename TSock::TBufferProvider buffers_;
   std::vector<std::unique_ptr<ListenSock>> listenSocks_;
   std::vector<struct io_uring_cqe*> cqes_;
   int listeners_ = 0;
@@ -1398,7 +1588,8 @@ Receiver makeIoUringRx(
   uint16_t port = pickPort(cfg);
 
   std::unique_ptr<RunnerBase> runner;
-  size_t flags = (rx_cfg.provide_buffers ? kUseBufferProviderFlag : 0) |
+  size_t flags = (rx_cfg.provide_buffers == 1 ? kUseBufferProviderFlag : 0) |
+      (rx_cfg.provide_buffers == 2 ? kUseBufferProviderV2Flag : 0) |
       (rx_cfg.fixed_files ? kUseFixedFilesFlag : 0) |
       (rx_cfg.loop_recv ? kLoopRecvFlag : 0);
 
@@ -1615,7 +1806,7 @@ io_uring_desc.add_options()
   switch (engine) {
     case RxEngine::IoUring:
       return [io_uring_cfg](Config const& cfg) -> Receiver {
-        return makeIoUringRx(cfg, io_uring_cfg, std::make_index_sequence<16>{});
+        return makeIoUringRx(cfg, io_uring_cfg, std::make_index_sequence<32>{});
       };
     case RxEngine::Epoll:
       return [epoll_cfg](Config const& cfg) -> Receiver {
