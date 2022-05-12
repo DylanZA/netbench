@@ -202,15 +202,14 @@ struct io_uring mkIoUring(IoUringRxConfig const& rx_cfg) {
   int cqe_count =
       rx_cfg.cqe_count <= 0 ? 8 * rx_cfg.sqe_count : rx_cfg.cqe_count;
 
-  params.flags |= IORING_SETUP_SUBMIT_ALL;
-
+  unsigned int newer_flags =
+      IORING_SETUP_SUBMIT_ALL | __IORING_SETUP_COOP_TASKRUN;
   params.flags |= IORING_SETUP_CQSIZE;
   params.cq_entries = cqe_count;
-  params.flags |= __IORING_SETUP_COOP_TASKRUN;
   int ret = io_uring_queue_init_params(rx_cfg.sqe_count, &ring, &params);
   if (ret < 0) {
-    log("trying init again without COOP_TASKRUN");
-    params.flags = params.flags & (~__IORING_SETUP_COOP_TASKRUN);
+    log("trying init again without COOP_TASKRUN or SUBMIT_ALL");
+    params.flags = params.flags & (~newer_flags);
     checkedErrno(
         io_uring_queue_init_params(rx_cfg.sqe_count, &ring, &params),
         "io_uring_queue_init_params");
@@ -526,7 +525,7 @@ class BufferProviderV1 : private boost::noncopyable {
   }
 
   char const* getData(uint16_t i) const {
-    return buffers_.at(i);
+    return buffers_[i];
   }
 
  private:
@@ -595,6 +594,22 @@ class BufferProviderV1 : private boost::noncopyable {
 };
 
 class BufferProviderV2 : private boost::noncopyable {
+ private:
+  struct __io_uring_buf_reg {
+    __u64 ring_addr;
+    __u32 ring_entries;
+    __u16 bgid;
+    __u16 pad;
+    __u64 resv[3];
+  };
+
+  struct __io_uring_buf {
+    __u64 addr;
+    __u32 len;
+    __u16 bid;
+    __u16 resv;
+  };
+
  public:
   static constexpr int kBgid = 1;
 
@@ -635,8 +650,11 @@ class BufferProviderV2 : private boost::noncopyable {
       die("buffer count too large: ", count);
     }
     for (uint16_t i = 0; i < count; i++) {
-      returnIndex(i);
+      populate(ring_[1 + i].buf, i);
     }
+    headCached_ = count;
+    ring_[0].head.store(headCached_, std::memory_order_release);
+
     vlog(
         "ring address=",
         ring_,
@@ -647,7 +665,7 @@ class BufferProviderV2 : private boost::noncopyable {
         " ring_mask=",
         ringMask_,
         " head now ",
-        nextHeadCached_ - 1);
+        headCached_);
   }
 
   ~BufferProviderV2() {
@@ -663,7 +681,7 @@ class BufferProviderV2 : private boost::noncopyable {
   }
 
   size_t toProvideCount() const {
-    return 0;
+    return cachedIndices;
   }
 
   bool canProvide() const {
@@ -676,23 +694,33 @@ class BufferProviderV2 : private boost::noncopyable {
 
   void compact() {}
 
-  void returnIndex(uint16_t i) {
-    auto& next = ring_[1 + (nextHeadCached_ & ringMask_)].buf;
-    next.bid = i;
-    next.addr = (__u64)getData(i);
+  inline void populate(struct __io_uring_buf& b, uint16_t i) {
+    b.bid = i;
+    b.addr = (__u64)getData(i);
 
     // can we assume kernel doesnt touch len or resv?
-    next.len = sizePerBuffer_;
-    next.resv = 0;
+    b.len = sizePerBuffer_;
+    b.resv = 0;
+  }
 
-    ring_[0].head.store(nextHeadCached_, std::memory_order_release);
-    nextHeadCached_++;
+  void returnIndex(uint16_t i) {
+    indices[cachedIndices++] = i;
+    if (likely(cachedIndices < indices.size())) {
+      return;
+    }
+    cachedIndices = 0;
+    for (uint16_t idx : indices) {
+      populate(ring_[1 + (headCached_ & ringMask_)].buf, idx);
+      ++headCached_;
+    }
+
+    ring_[0].head.store(headCached_, std::memory_order_release);
   }
 
   void provide(struct io_uring_sqe*) {}
 
   char const* getData(uint16_t i) const {
-    return buffers_.at(i);
+    return buffers_[i];
   }
 
   void initialRegister(struct io_uring* ring) {
@@ -703,31 +731,17 @@ class BufferProviderV2 : private boost::noncopyable {
     reg.bgid = kBgid;
     static constexpr int __IORING_REGISTER_PBUF_RING = 22;
 
-    auto head_was = ring_[0].head.load();
     checkedErrno(
         ____sys_io_uring_register(
             ring->ring_fd, __IORING_REGISTER_PBUF_RING, (void*)&reg, 1),
         "register pbuf");
 
     // silly io_uring, clobbering our data:
-    ring_[0].head.store(head_was);
+    ring_[0].head.store(headCached_);
   }
 
  private:
   static constexpr int kAlignment = 32;
-  struct __io_uring_buf_reg {
-    __u64 ring_addr;
-    __u32 ring_entries;
-    __u16 bgid;
-    __u16 pad;
-    __u64 resv[3];
-  };
-  struct __io_uring_buf {
-    __u64 addr;
-    __u32 len;
-    __u16 bid;
-    __u16 resv;
-  };
 
   union entry_union {
     entry_union() : buf() {}
@@ -744,12 +758,13 @@ class BufferProviderV2 : private boost::noncopyable {
   std::vector<char, boost::alignment::aligned_allocator<char, kAlignment>>
       buffer_;
   std::vector<char*> buffers_;
-  uint32_t nextHeadCached_ = 0;
+  uint32_t headCached_ = 0;
   size_t ringMemSize_;
   uint32_t ringSize_;
   uint32_t ringMask_;
-
+  uint32_t cachedIndices = 0;
   entry_union* ring_;
+  std::array<uint16_t, 32> indices;
 };
 
 static constexpr int kUseBufferProviderFlag = 1;
