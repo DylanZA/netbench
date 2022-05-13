@@ -636,7 +636,7 @@ class BufferProviderV2 : private boost::noncopyable {
     int extra_mmap_flags = 0;
     char* buffer_base;
 
-    ringMemSize_ = (ringSize_ + 1) * sizeof(entry_union);
+    ringMemSize_ = ringSize_ * sizeof(entry_union);
     ringMemSize_ = (ringMemSize_ + kBufferAlignMask) & (~kBufferAlignMask);
     bufferMmapSize_ = count_ * sizePerBuffer_ + ringMemSize_;
     size_t page_mask = 4095;
@@ -675,13 +675,12 @@ class BufferProviderV2 : private boost::noncopyable {
       buffers_.push_back(buffer_base + i * sizePerBuffer_);
     }
 
-    ring_[0].head = 0;
     if (count_ >= std::numeric_limits<uint16_t>::max()) {
       die("buffer count too large: ", count_);
     }
     for (uint16_t i = 0; i < count_; i++) {
-      ring_[i + 1].buf = {};
-      populate(ring_[1 + i].buf, i);
+      ring_[i].buf = {};
+      populate(ring_[i].buf, i);
     }
     headCached_ = count_;
     ring_[0].head.store(headCached_, std::memory_order_release);
@@ -731,7 +730,7 @@ class BufferProviderV2 : private boost::noncopyable {
 
     // can we assume kernel doesnt touch len or resv?
     b.len = sizePerBuffer_;
-    b.resv = 0;
+    // b.resv = 0;
   }
 
   void returnIndex(uint16_t i) {
@@ -741,7 +740,7 @@ class BufferProviderV2 : private boost::noncopyable {
     }
     cachedIndices = 0;
     for (uint16_t idx : indices) {
-      populate(ring_[1 + (headCached_ & ringMask_)].buf, idx);
+      populate(ring_[(headCached_ & ringMask_)].buf, idx);
       ++headCached_;
     }
 
@@ -777,7 +776,12 @@ class BufferProviderV2 : private boost::noncopyable {
   union entry_union {
     entry_union() : buf() {}
     entry_union(entry_union const& r) : buf(r.buf) {}
-    std::atomic<__u32> head;
+    struct {
+      __u64 resv1;
+      __u32 resv2;
+      __u16 resv3;
+      std::atomic<__u16> head;
+    };
     struct __io_uring_buf buf;
   };
 
@@ -1158,7 +1162,7 @@ struct IOUringRunner : public RunnerBase {
       addRead(sock);
     } else if (amount <= 0) {
       if (unlikely(cqe->res == -ENOBUFS)) {
-        log("not enough buffers, but will just requeue. so far have ",
+        die("not enough buffers, but will just requeue. so far have ",
             ++enobuffCount_,
             "state: can provide=",
             buffers_.toProvideCount(),
