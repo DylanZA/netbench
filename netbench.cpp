@@ -26,8 +26,12 @@ namespace po = boost::program_options;
 namespace {
 static constexpr uint32_t __IORING_SETUP_COOP_TASKRUN = (1U << 8);
 
+#ifndef __NR_io_uring_enter
 static constexpr int __NR_io_uring_enter = 426;
+#endif
+#ifndef __NR_io_uring_register
 static constexpr int __NR_io_uring_register = 427;
+#endif
 static inline int ____sys_io_uring_register(
     int fd,
     unsigned opcode,
