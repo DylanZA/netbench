@@ -441,7 +441,7 @@ class BufferProviderV1 : private boost::noncopyable {
         lowWatermark_(rx_cfg.provided_buffer_low_watermark) {
     auto count = rx_cfg.provided_buffer_count;
     buffer_.resize(count * sizePerBuffer_);
-    for (size_t i = 0; i < count; i++) {
+    for (ssize_t i = 0; i < count; i++) {
       buffers_.push_back(buffer_.data() + i * sizePerBuffer_);
     }
     toProvide_.reserve(128);

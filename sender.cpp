@@ -1192,7 +1192,7 @@ struct EpollConnection {
 
   int fd = -1;
   char* toSendAt = nullptr;
-  size_t toSend = 0;
+  ssize_t toSend = 0;
   TClock::time_point last;
   std::vector<std::chrono::microseconds> latencies;
 };
@@ -1342,7 +1342,7 @@ class EpollSender : public ISender {
     end_ = TClock::now() +
         std::chrono::milliseconds(
                static_cast<uint64_t>(cfg_.run_seconds * 1000.0));
-    for (int i = 0; i < connections_.size(); i++) {
+    for (unsigned int i = 0; i < connections_.size(); i++) {
       doSend(i, false);
     }
     std::array<struct epoll_event, 1024> epoll_events;
