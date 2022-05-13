@@ -111,3 +111,5 @@ inline auto wrapThread(std::string name, FN&& fn) {
 boost::program_options::variables_map simpleParse(
     boost::program_options::options_description desc,
     std::vector<std::string> const& splits);
+
+void checkHugePages(int count);

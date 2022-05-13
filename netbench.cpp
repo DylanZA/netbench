@@ -641,6 +641,7 @@ class BufferProviderV2 : private boost::noncopyable {
       bufferMmapSize_ = (bufferMmapSize_ + kHugePageMask) & (~kHugePageMask);
       extra_mmap_flags |= MAP_HUGETLB;
       page_mask = kHugePageMask;
+      checkHugePages(bufferMmapSize_ / (1+kHugePageMask));
     }
 
     bufferMmap_ = mmap(
