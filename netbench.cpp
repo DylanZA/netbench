@@ -102,6 +102,7 @@ struct IoUringRxConfig : RxConfig {
   int provided_buffer_low_watermark = -1;
   int provided_buffer_compact = 1;
   bool huge_pages = false;
+  bool no_mmap = false;
 
   std::string const toString() const {
     // only give the important options:
@@ -200,9 +201,9 @@ int mkServerSock(
   return fd;
 }
 
-struct io_uring mkIoUring(IoUringRxConfig const& rx_cfg) {
+std::pair<unsigned int, struct io_uring_params> mkIoUringParams(
+    IoUringRxConfig const& rx_cfg) {
   struct io_uring_params params;
-  struct io_uring ring;
   memset(&params, 0, sizeof(params));
 
   // default to 8x sqe_count as we are very happy to submit multiple sqe off one
@@ -210,17 +211,123 @@ struct io_uring mkIoUring(IoUringRxConfig const& rx_cfg) {
   int cqe_count =
       rx_cfg.cqe_count <= 0 ? 8 * rx_cfg.sqe_count : rx_cfg.cqe_count;
 
-  unsigned int newer_flags =
-      IORING_SETUP_SUBMIT_ALL | __IORING_SETUP_COOP_TASKRUN;
   params.flags |= IORING_SETUP_CQSIZE;
   params.cq_entries = cqe_count;
-  int ret = io_uring_queue_init_params(rx_cfg.sqe_count, &ring, &params);
-  if (ret < 0) {
-    log("trying init again without COOP_TASKRUN or SUBMIT_ALL");
-    params.flags = params.flags & (~newer_flags);
+  return {rx_cfg.sqe_count, params};
+}
+
+template <class TProvidedBuffers>
+class HugeBuffer : private boost::noncopyable {
+ public:
+  static constexpr size_t kHugePageMask = (1LLU << 21) - 1; // 2MB
+
+  HugeBuffer(IoUringRxConfig const& rx_cfg) {
+    buffersSize_ = TProvidedBuffers::getSize(rx_cfg);
+    auto const [entries, params] = mkIoUringParams(rx_cfg);
     checkedErrno(
-        io_uring_queue_init_params(rx_cfg.sqe_count, &ring, &params),
-        "io_uring_queue_init_params");
+        io_uring_queue_required_mem(entries, &params, &ringSize_),
+        "calculate ring size");
+
+    // buffers wants to be at the start of a page
+    if (!rx_cfg.no_mmap) {
+      ringSize_ = 0;
+    }
+    ringSize_ = (ringSize_ + 4095) & (~4095LLU);
+
+    allSize_ = ringSize_ + buffersSize_;
+    allSize_ = (allSize_ + 4095) & (~4095LLU);
+
+    int extra_mmap_flags = 0;
+
+    if (rx_cfg.huge_pages) {
+      allSize_ = (allSize_ + kHugePageMask) & (~kHugePageMask);
+      extra_mmap_flags |= MAP_HUGETLB;
+      checkHugePages(allSize_ / (1 + kHugePageMask));
+    }
+
+    buffer_ = mmap(
+        NULL,
+        allSize_,
+        PROT_READ | PROT_WRITE,
+        MAP_ANONYMOUS | MAP_PRIVATE | extra_mmap_flags,
+        -1,
+        0);
+
+    if (buffer_ == MAP_FAILED) {
+      auto errnoCopy = errno;
+      die("unable to allocate pages of size ",
+          allSize_,
+          ": ",
+          strerror(errnoCopy));
+    }
+
+    ringPtr_ = buffer_;
+    buffersPtr_ = (void*)((uint64_t)buffer_ + ringSize_);
+
+    vlog(
+        "made huge buffer size ",
+        allSize_,
+        " starting at ",
+        buffer_,
+        " ring: (",
+        ringPtr_,
+        ", ",
+        ringSize_,
+        ")",
+        " buffers: (",
+        buffersPtr_,
+        ", ",
+        buffersSize_,
+        ")");
+  }
+
+  std::pair<void*, size_t> ring() const {
+    return std::make_pair(ringPtr_, ringSize_);
+  }
+
+  std::pair<void*, size_t> buffer() const {
+    return std::make_pair(buffersPtr_, buffersSize_);
+  }
+
+  ~HugeBuffer() {
+    munmap(buffer_, allSize_);
+  }
+
+ private:
+  void* buffer_;
+  size_t allSize_;
+
+  void* buffersPtr_;
+  size_t buffersSize_;
+
+  void* ringPtr_;
+  size_t ringSize_;
+};
+
+template <class THugeBuffer>
+struct io_uring mkIoUring(IoUringRxConfig const& rx_cfg, THugeBuffer& buffer) {
+  struct io_uring ring;
+  auto entries_params = mkIoUringParams(rx_cfg);
+  auto& entries = entries_params.first;
+  auto& params = entries_params.second;
+  unsigned int const newer_flags =
+      IORING_SETUP_SUBMIT_ALL | __IORING_SETUP_COOP_TASKRUN;
+
+  auto initRings = [&]() -> int {
+    if (rx_cfg.no_mmap) {
+      auto buf = buffer.ring();
+      return io_uring_queue_init_mem(
+          entries, &ring, &params, buf.first, buf.second);
+    } else {
+      return io_uring_queue_init_params(entries, &ring, &params);
+    }
+  };
+
+  int ret = initRings();
+  if (ret < 0) {
+    log("trying init again without COOP_TASKRUN or SUBMIT_ALL as ret=", ret);
+    params.flags = params.flags & (~newer_flags);
+    checkedErrno(initRings(), "io_uring_queue_init_params");
   }
 
   if (rx_cfg.register_ring) {
@@ -436,18 +543,28 @@ class BufferProviderV1 : private boost::noncopyable {
  public:
   static constexpr int kBgid = 1;
 
-  explicit BufferProviderV1(IoUringRxConfig const& rx_cfg)
+  explicit BufferProviderV1(
+      IoUringRxConfig const& rx_cfg,
+      HugeBuffer<BufferProviderV1>& buffers)
       : sizePerBuffer_(addAlignment(rx_cfg.recv_size)),
         lowWatermark_(rx_cfg.provided_buffer_low_watermark) {
     auto count = rx_cfg.provided_buffer_count;
-    buffer_.resize(count * sizePerBuffer_);
+    auto buff = buffers.buffer();
+    if (buff.second < count * sizePerBuffer_) {
+      die("buffer not big enough: ", buff.second);
+    }
+    char* buffer = (char*)buff.first;
     for (ssize_t i = 0; i < count; i++) {
-      buffers_.push_back(buffer_.data() + i * sizePerBuffer_);
+      buffers_.push_back(buffer + i * sizePerBuffer_);
     }
     toProvide_.reserve(128);
     toProvide2_.reserve(128);
     toProvide_.emplace_back(0, count);
     toProvideCount_ = count;
+  }
+
+  static size_t getSize(IoUringRxConfig const& rx_cfg) {
+    return rx_cfg.provided_buffer_count * addAlignment(rx_cfg.recv_size);
   }
 
   size_t count() const {
@@ -539,7 +656,7 @@ class BufferProviderV1 : private boost::noncopyable {
  private:
   static constexpr int kAlignment = 32;
 
-  size_t addAlignment(size_t n) {
+  static size_t addAlignment(size_t n) {
     return kAlignment * ((n + kAlignment - 1) / kAlignment);
   }
 
@@ -592,8 +709,6 @@ class BufferProviderV1 : private boost::noncopyable {
   };
 
   size_t sizePerBuffer_;
-  std::vector<char, boost::alignment::aligned_allocator<char, kAlignment>>
-      buffer_;
   std::vector<char*> buffers_;
   ssize_t toProvideCount_ = 0;
   int lowWatermark_;
@@ -620,57 +735,52 @@ class BufferProviderV2 : private boost::noncopyable {
 
  public:
   static constexpr int kBgid = 1;
-  static constexpr size_t kHugePageMask = (1LLU << 21) - 1; // 2MB
   static constexpr size_t kBufferAlignMask = 31LLU;
 
-  explicit BufferProviderV2(IoUringRxConfig const& rx_cfg)
-      : count_(rx_cfg.provided_buffer_count),
-        sizePerBuffer_(addAlignment(rx_cfg.recv_size)) {
-    ringSize_ = 1;
-    ringMask_ = 0;
-    while (ringSize_ < count_) {
-      ringSize_ *= 2;
-      ringMask_ = (ringMask_ << 1) | 1;
+  struct Sizes {
+    size_t ringSize;
+    size_t ringMask;
+    size_t ringMemSize;
+    size_t sizePerBuffer;
+    size_t count;
+    size_t totalSize;
+  };
+  static Sizes calcSizes(IoUringRxConfig const& rx_cfg) {
+    Sizes ret;
+    ret.count = rx_cfg.provided_buffer_count;
+    ret.sizePerBuffer = addAlignment(rx_cfg.recv_size);
+    ret.ringSize = 1;
+    ret.ringMask = 0;
+    while (ret.ringSize < ret.count) {
+      ret.ringSize *= 2;
+      ret.ringMask = (ret.ringMask << 1) | 1;
     }
 
-    int extra_mmap_flags = 0;
-    char* buffer_base;
+    ret.ringMemSize = ret.ringSize * sizeof(entry_union);
+    ret.ringMemSize =
+        (ret.ringMemSize + kBufferAlignMask) & (~kBufferAlignMask);
+    ret.totalSize = ret.count * ret.sizePerBuffer + ret.ringMemSize;
 
-    ringMemSize_ = ringSize_ * sizeof(entry_union);
-    ringMemSize_ = (ringMemSize_ + kBufferAlignMask) & (~kBufferAlignMask);
-    bufferMmapSize_ = count_ * sizePerBuffer_ + ringMemSize_;
-    size_t page_mask = 4095;
+    return ret;
+  }
 
-    if (rx_cfg.huge_pages) {
-      bufferMmapSize_ = (bufferMmapSize_ + kHugePageMask) & (~kHugePageMask);
-      extra_mmap_flags |= MAP_HUGETLB;
-      page_mask = kHugePageMask;
-      checkHugePages(bufferMmapSize_ / (1+kHugePageMask));
-    }
+  static size_t getSize(IoUringRxConfig const& rx_cfg) {
+    auto sizes = calcSizes(rx_cfg);
+    return sizes.totalSize;
+  }
 
-    bufferMmap_ = mmap(
-        NULL,
-        bufferMmapSize_,
-        PROT_READ | PROT_WRITE,
-        MAP_ANONYMOUS | MAP_PRIVATE | extra_mmap_flags,
-        -1,
-        0);
-    vlog(
-        "mmap buffer size=",
-        bufferMmapSize_,
-        " ring size=",
-        ringMemSize_,
-        " pages=",
-        bufferMmapSize_ / (1 + page_mask));
-    if (bufferMmap_ == MAP_FAILED) {
-      auto errnoCopy = errno;
-      die("unable to allocate pages of size ",
-          bufferMmapSize_,
-          ": ",
-          strerror(errnoCopy));
-    }
-    buffer_base = (char*)bufferMmap_ + ringMemSize_;
-    ring_ = (entry_union*)bufferMmap_;
+  explicit BufferProviderV2(
+      IoUringRxConfig const& rx_cfg,
+      HugeBuffer<BufferProviderV2>& buffers) {
+    auto const sizes = calcSizes(rx_cfg);
+    count_ = sizes.count;
+    sizePerBuffer_ = sizes.sizePerBuffer;
+    ringMask_ = sizes.ringMask;
+    ringSize_ = sizes.ringSize;
+
+    auto buff = buffers.buffer();
+    auto* buffer_base = (char*)buff.first + sizes.ringMemSize;
+    ring_ = (entry_union*)buff.first;
     for (size_t i = 0; i < count_; i++) {
       buffers_.push_back(buffer_base + i * sizePerBuffer_);
     }
@@ -698,9 +808,7 @@ class BufferProviderV2 : private boost::noncopyable {
         headCached_);
   }
 
-  ~BufferProviderV2() {
-    munmap(bufferMmap_, bufferMmapSize_);
-  }
+  ~BufferProviderV2() {}
 
   size_t count() const {
     return count_;
@@ -785,17 +893,14 @@ class BufferProviderV2 : private boost::noncopyable {
     struct __io_uring_buf buf;
   };
 
-  size_t addAlignment(size_t n) {
+  static size_t addAlignment(size_t n) {
     return kAlignment * ((n + kAlignment - 1) / kAlignment);
   }
 
   size_t count_;
   size_t sizePerBuffer_;
-  size_t bufferMmapSize_ = 0;
-  void* bufferMmap_ = nullptr;
   std::vector<char*> buffers_;
   uint32_t headCached_ = 0;
-  size_t ringMemSize_;
   uint32_t ringSize_;
   uint32_t ringMask_;
   uint32_t cachedIndices = 0;
@@ -956,15 +1061,18 @@ struct ListenSock : private boost::noncopyable {
 
 template <class TSock>
 struct IOUringRunner : public RunnerBase {
+  using THugeBuffer = HugeBuffer<typename TSock::TBufferProvider>;
   explicit IOUringRunner(
       Config const& cfg,
       IoUringRxConfig const& rx_cfg,
-      std::string const& name)
+      std::string const& name,
+      std::unique_ptr<THugeBuffer> huge_buffer)
       : RunnerBase(name),
         cfg_(cfg),
         rxCfg_(rx_cfg),
-        ring(mkIoUring(rx_cfg)),
-        buffers_(rx_cfg) {
+        ring(mkIoUring(rx_cfg, *huge_buffer)),
+        buffers_(rx_cfg, *huge_buffer) {
+    hugeBuffer_ = std::move(huge_buffer);
     if (TSock::kUseFixedFiles && TSock::kShouldLoop) {
       die("can't have fixed files and looping, "
           "we don't have the fd to call recv() !");
@@ -1401,6 +1509,7 @@ struct IOUringRunner : public RunnerBase {
   int listeners_ = 0;
   uint32_t enobuffCount_ = 0;
   std::vector<int> acceptFdPool_;
+  std::unique_ptr<THugeBuffer> hugeBuffer_;
 };
 
 static constexpr uint32_t kSocket = 0;
@@ -1690,9 +1799,12 @@ void mbIoUringRxFactory(
     if (runner) {
       die("already had a runner? flags=", flags, " this=", MbFlag);
     }
-    runner =
-        std::make_unique<IOUringRunner<typename BasicSockPicker<MbFlag>::Sock>>(
-            cfg, rx_cfg, name);
+    using Runner = IOUringRunner<typename BasicSockPicker<MbFlag>::Sock>;
+    runner = std::make_unique<Runner>(
+        cfg,
+        rx_cfg,
+        name,
+        std::make_unique<typename Runner::THugeBuffer>(rx_cfg));
   }
 }
 
@@ -1881,6 +1993,8 @@ io_uring_desc.add_options()
      ->default_value(io_uring_cfg.max_cqe_loop))
   ("huge_pages",  po::value(&io_uring_cfg.huge_pages)
      ->default_value(io_uring_cfg.huge_pages))
+  ("no_mmap",  po::value(&io_uring_cfg.no_mmap)
+     ->default_value(io_uring_cfg.no_mmap))
   ("supports_nonblock_accept",  po::value(&io_uring_cfg.supports_nonblock_accept)
      ->default_value(io_uring_cfg.supports_nonblock_accept))
   ("register_ring",  po::value(&io_uring_cfg.register_ring)
