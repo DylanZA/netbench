@@ -603,21 +603,6 @@ class BufferProviderV1 : private boost::noncopyable {
 
 class BufferProviderV2 : private boost::noncopyable {
  private:
-  struct __io_uring_buf_reg {
-    __u64 ring_addr;
-    __u32 ring_entries;
-    __u16 bgid;
-    __u16 pad;
-    __u64 resv[3];
-  };
-
-  struct __io_uring_buf {
-    __u64 addr;
-    __u32 len;
-    __u16 bid;
-    __u16 resv;
-  };
-
  public:
   static constexpr int kBgid = 1;
   static constexpr size_t kHugePageMask = (1LLU << 21) - 1; // 2MB
@@ -630,13 +615,13 @@ class BufferProviderV2 : private boost::noncopyable {
     ringMask_ = 0;
     while (ringSize_ < count_) {
       ringSize_ *= 2;
-      ringMask_ = (ringMask_ << 1) | 1;
     }
+    ringMask_ = io_uring_buf_ring_mask(ringSize_);
 
     int extra_mmap_flags = 0;
     char* buffer_base;
 
-    ringMemSize_ = ringSize_ * sizeof(entry_union);
+    ringMemSize_ = ringSize_ * sizeof(struct io_uring_buf);
     ringMemSize_ = (ringMemSize_ + kBufferAlignMask) & (~kBufferAlignMask);
     bufferMmapSize_ = count_ * sizePerBuffer_ + ringMemSize_;
     size_t page_mask = 4095;
@@ -645,7 +630,7 @@ class BufferProviderV2 : private boost::noncopyable {
       bufferMmapSize_ = (bufferMmapSize_ + kHugePageMask) & (~kHugePageMask);
       extra_mmap_flags |= MAP_HUGETLB;
       page_mask = kHugePageMask;
-      checkHugePages(bufferMmapSize_ / (1+kHugePageMask));
+      checkHugePages(bufferMmapSize_ / (1 + kHugePageMask));
     }
 
     bufferMmap_ = mmap(
@@ -670,7 +655,8 @@ class BufferProviderV2 : private boost::noncopyable {
           strerror(errnoCopy));
     }
     buffer_base = (char*)bufferMmap_ + ringMemSize_;
-    ring_ = (entry_union*)bufferMmap_;
+    ring_ = (struct io_uring_buf_ring*)bufferMmap_;
+    io_uring_buf_ring_init(ring_);
     for (size_t i = 0; i < count_; i++) {
       buffers_.push_back(buffer_base + i * sizePerBuffer_);
     }
@@ -679,11 +665,11 @@ class BufferProviderV2 : private boost::noncopyable {
       die("buffer count too large: ", count_);
     }
     for (uint16_t i = 0; i < count_; i++) {
-      ring_[i].buf = {};
-      populate(ring_[i].buf, i);
+      ring_->bufs[i] = {};
+      populate(ring_->bufs[i], i);
     }
-    headCached_ = count_;
-    ring_[0].head.store(headCached_, std::memory_order_release);
+    tailCached_ = count_;
+    io_uring_smp_store_release(&ring_->tail, tailCached_);
 
     vlog(
         "ring address=",
@@ -694,8 +680,8 @@ class BufferProviderV2 : private boost::noncopyable {
         count_,
         " ring_mask=",
         ringMask_,
-        " head now ",
-        headCached_);
+        " tail now ",
+        tailCached_);
   }
 
   ~BufferProviderV2() {
@@ -724,7 +710,7 @@ class BufferProviderV2 : private boost::noncopyable {
 
   void compact() {}
 
-  inline void populate(struct __io_uring_buf& b, uint16_t i) {
+  inline void populate(struct io_uring_buf& b, uint16_t i) {
     b.bid = i;
     b.addr = (__u64)getData(i);
 
@@ -740,11 +726,11 @@ class BufferProviderV2 : private boost::noncopyable {
     }
     cachedIndices = 0;
     for (uint16_t idx : indices) {
-      populate(ring_[(headCached_ & ringMask_)].buf, idx);
-      ++headCached_;
+      populate(ring_->bufs[(tailCached_ & ringMask_)], idx);
+      ++tailCached_;
     }
 
-    ring_[0].head.store(headCached_, std::memory_order_release);
+    io_uring_smp_store_release(&ring_->tail, tailCached_);
   }
 
   void provide(struct io_uring_sqe*) {}
@@ -754,36 +740,16 @@ class BufferProviderV2 : private boost::noncopyable {
   }
 
   void initialRegister(struct io_uring* ring) {
-    __io_uring_buf_reg reg;
+    struct io_uring_buf_reg reg;
     memset(&reg, 0, sizeof(reg));
     reg.ring_addr = (__u64)ring_;
     reg.ring_entries = ringSize_;
     reg.bgid = kBgid;
-    static constexpr int __IORING_REGISTER_PBUF_RING = 22;
-
-    checkedErrno(
-        ____sys_io_uring_register(
-            ring->ring_fd, __IORING_REGISTER_PBUF_RING, (void*)&reg, 1),
-        "register pbuf");
-
-    // silly io_uring, clobbering our data:
-    ring_[0].head.store(headCached_);
+    checkedErrno(io_uring_register_buf_ring(ring, &reg, 0), "register pbuf");
   }
 
  private:
   static constexpr int kAlignment = 32;
-
-  union entry_union {
-    entry_union() : buf() {}
-    entry_union(entry_union const& r) : buf(r.buf) {}
-    struct {
-      __u64 resv1;
-      __u32 resv2;
-      __u16 resv3;
-      std::atomic<__u16> head;
-    };
-    struct __io_uring_buf buf;
-  };
 
   size_t addAlignment(size_t n) {
     return kAlignment * ((n + kAlignment - 1) / kAlignment);
@@ -794,12 +760,12 @@ class BufferProviderV2 : private boost::noncopyable {
   size_t bufferMmapSize_ = 0;
   void* bufferMmap_ = nullptr;
   std::vector<char*> buffers_;
-  uint32_t headCached_ = 0;
+  uint16_t tailCached_ = 0;
   size_t ringMemSize_;
   uint32_t ringSize_;
   uint32_t ringMask_;
   uint32_t cachedIndices = 0;
-  entry_union* ring_;
+  struct io_uring_buf_ring* ring_;
   std::array<uint16_t, 32> indices;
 };
 
