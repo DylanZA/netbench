@@ -91,7 +91,7 @@ struct RxConfig {
 struct IoUringRxConfig : RxConfig {
   bool supports_nonblock_accept = false;
   bool register_ring = true;
-  int provide_buffers = 1;
+  int provide_buffers = 2;
   bool fixed_files = true;
   bool loop_recv = false;
   int sqe_count = 64;
