@@ -93,7 +93,6 @@ struct IoUringRxConfig : RxConfig {
   bool register_ring = true;
   int provide_buffers = 2;
   bool fixed_files = true;
-  bool loop_recv = false;
   int sqe_count = 64;
   int cqe_count = 0;
   int max_cqe_loop = 256 * 32;
@@ -772,7 +771,6 @@ class BufferProviderV2 : private boost::noncopyable {
 static constexpr int kUseBufferProviderFlag = 1;
 static constexpr int kUseBufferProviderV2Flag = 2;
 static constexpr int kUseFixedFilesFlag = 4;
-static constexpr int kLoopRecvFlag = 8;
 
 int providedBufferIdx(struct io_uring_cqe* cqe) {
   return cqe->flags >> 16;
@@ -785,7 +783,6 @@ struct BasicSock {
       : (Flags & kUseBufferProviderFlag) ? 1
                                          : 0;
   static constexpr bool kUseFixedFiles = Flags & kUseFixedFilesFlag;
-  static constexpr bool kShouldLoop = Flags & kLoopRecvFlag;
 
   using TBufferProvider = std::conditional_t<
       kUseBufferProviderVersion == 2,
@@ -866,12 +863,6 @@ struct BasicSock {
     } else {
       didRead(res);
     }
-    while (kShouldLoop && res == (int)size) {
-      res = recv(this->fd_, buff, sizeof(buff), MSG_NOSIGNAL);
-      if (res > 0) {
-        didRead(res);
-      }
-    }
     return recycleBufferIdx;
   }
 
@@ -931,11 +922,6 @@ struct IOUringRunner : public RunnerBase {
         rxCfg_(rx_cfg),
         ring(mkIoUring(rx_cfg)),
         buffers_(rx_cfg) {
-    if (TSock::kUseFixedFiles && TSock::kShouldLoop) {
-      die("can't have fixed files and looping, "
-          "we don't have the fd to call recv() !");
-    }
-
     cqes_.resize(rx_cfg.max_events);
 
     if (TSock::kUseBufferProviderVersion) {
@@ -1672,8 +1658,7 @@ Receiver makeIoUringRx(
   std::unique_ptr<RunnerBase> runner;
   size_t flags = (rx_cfg.provide_buffers == 1 ? kUseBufferProviderFlag : 0) |
       (rx_cfg.provide_buffers == 2 ? kUseBufferProviderV2Flag : 0) |
-      (rx_cfg.fixed_files ? kUseFixedFilesFlag : 0) |
-      (rx_cfg.loop_recv ? kLoopRecvFlag : 0);
+      (rx_cfg.fixed_files ? kUseFixedFilesFlag : 0);
 
   ((mbIoUringRxFactory<PossibleFlag>(
        cfg, rx_cfg, strcat("io_uring port=", port), flags, runner)),
@@ -1841,8 +1826,6 @@ io_uring_desc.add_options()
      ->default_value(io_uring_cfg.provide_buffers))
   ("fixed_files",  po::value(&io_uring_cfg.fixed_files)
      ->default_value(io_uring_cfg.fixed_files))
-  ("loop_recv", po::value(&io_uring_cfg.loop_recv)
-     ->default_value(io_uring_cfg.loop_recv))
   ("max_cqe_loop",  po::value(&io_uring_cfg.max_cqe_loop)
      ->default_value(io_uring_cfg.max_cqe_loop))
   ("huge_pages",  po::value(&io_uring_cfg.huge_pages)
@@ -1888,7 +1871,7 @@ io_uring_desc.add_options()
   switch (engine) {
     case RxEngine::IoUring:
       return [io_uring_cfg](Config const& cfg) -> Receiver {
-        return makeIoUringRx(cfg, io_uring_cfg, std::make_index_sequence<32>{});
+        return makeIoUringRx(cfg, io_uring_cfg, std::make_index_sequence<16>{});
       };
     case RxEngine::Epoll:
       return [epoll_cfg](Config const& cfg) -> Receiver {
