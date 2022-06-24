@@ -101,6 +101,7 @@ struct IoUringRxConfig : RxConfig {
   int provided_buffer_low_watermark = -1;
   int provided_buffer_compact = 1;
   bool huge_pages = false;
+  bool multishot_recv = false;
 
   std::string const toString() const {
     // only give the important options:
@@ -134,7 +135,10 @@ struct IoUringRxConfig : RxConfig {
             : strcat(" max_cqe_loop=", max_cqe_loop),
         is_default(&IoUringRxConfig::huge_pages)
             ? ""
-            : strcat(" huge_pages=", huge_pages));
+            : strcat(" huge_pages=", huge_pages),
+        is_default(&IoUringRxConfig::multishot_recv)
+            ? ""
+            : strcat(" multishot_recv=", multishot_recv));
   }
 };
 
@@ -771,6 +775,7 @@ class BufferProviderV2 : private boost::noncopyable {
 static constexpr int kUseBufferProviderFlag = 1;
 static constexpr int kUseBufferProviderV2Flag = 2;
 static constexpr int kUseFixedFilesFlag = 4;
+static constexpr int kMultiShotRecvFlag = 8;
 
 int providedBufferIdx(struct io_uring_cqe* cqe) {
   return cqe->flags >> 16;
@@ -783,6 +788,7 @@ struct BasicSock {
       : (Flags & kUseBufferProviderFlag) ? 1
                                          : 0;
   static constexpr bool kUseFixedFiles = Flags & kUseFixedFilesFlag;
+  static constexpr bool kMultiShotRecv = Flags & kMultiShotRecvFlag;
 
   using TBufferProvider = std::conditional_t<
       kUseBufferProviderVersion == 2,
@@ -821,8 +827,13 @@ struct BasicSock {
 
   void addRead(struct io_uring_sqe* sqe, TBufferProvider& provider) {
     if (kUseBufferProviderVersion) {
-      io_uring_prep_recv(sqe, fd_, NULL, provider.sizePerBuffer(), 0);
+      size_t const size = kMultiShotRecv ? 0LLU : provider.sizePerBuffer();
+      io_uring_prep_recv(sqe, fd_, NULL, size, 0);
       sqe->flags |= IOSQE_BUFFER_SELECT;
+      if (kMultiShotRecv) {
+        // #define IORING_RECV_MULTISHOT	(1U << 1)
+        sqe->addr2 |= (1U << 1);
+      }
       sqe->buf_group = TBufferProvider::kBgid;
     } else {
       io_uring_prep_recv(sqe, fd_, &buff[0], sizeof(buff), 0);
@@ -1111,7 +1122,9 @@ struct IOUringRunner : public RunnerBase {
         addSend(sock, sends);
       }
       didRead(amount);
-      addRead(sock);
+      if (!TSock::kMultiShotRecv || !(cqe->flags & IORING_CQE_F_MORE)) {
+        addRead(sock);
+      }
     } else if (amount <= 0) {
       if (unlikely(cqe->res == -ENOBUFS)) {
         die("not enough buffers, but will just requeue. so far have ",
@@ -1658,7 +1671,8 @@ Receiver makeIoUringRx(
   std::unique_ptr<RunnerBase> runner;
   size_t flags = (rx_cfg.provide_buffers == 1 ? kUseBufferProviderFlag : 0) |
       (rx_cfg.provide_buffers == 2 ? kUseBufferProviderV2Flag : 0) |
-      (rx_cfg.fixed_files ? kUseFixedFilesFlag : 0);
+      (rx_cfg.fixed_files ? kUseFixedFilesFlag : 0) |
+      (rx_cfg.multishot_recv ? kMultiShotRecvFlag : 0);
 
   ((mbIoUringRxFactory<PossibleFlag>(
        cfg, rx_cfg, strcat("io_uring port=", port), flags, runner)),
@@ -1830,6 +1844,8 @@ io_uring_desc.add_options()
      ->default_value(io_uring_cfg.max_cqe_loop))
   ("huge_pages",  po::value(&io_uring_cfg.huge_pages)
      ->default_value(io_uring_cfg.huge_pages))
+  ("multishot_recv",  po::value(&io_uring_cfg.multishot_recv)
+     ->default_value(io_uring_cfg.multishot_recv))
   ("supports_nonblock_accept",  po::value(&io_uring_cfg.supports_nonblock_accept)
      ->default_value(io_uring_cfg.supports_nonblock_accept))
   ("register_ring",  po::value(&io_uring_cfg.register_ring)
@@ -1871,7 +1887,7 @@ io_uring_desc.add_options()
   switch (engine) {
     case RxEngine::IoUring:
       return [io_uring_cfg](Config const& cfg) -> Receiver {
-        return makeIoUringRx(cfg, io_uring_cfg, std::make_index_sequence<16>{});
+        return makeIoUringRx(cfg, io_uring_cfg, std::make_index_sequence<32>{});
       };
     case RxEngine::Epoll:
       return [epoll_cfg](Config const& cfg) -> Receiver {
