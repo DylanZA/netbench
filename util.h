@@ -113,3 +113,4 @@ boost::program_options::variables_map simpleParse(
     std::vector<std::string> const& splits);
 
 void checkHugePages(int count);
+std::string hexdump(void const* p, size_t n);

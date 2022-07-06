@@ -80,3 +80,14 @@ void checkHugePages(int count) {
   }
   close(file);
 }
+
+std::string hexdump(void const* p, size_t n) {
+  std::stringstream ss;
+  ss << "[size=" << n << "] ";
+  ss << std::setfill('0') << std::setw(2) << std::hex << std::uppercase;
+  char const* p2 = (char const*)p;
+  for (size_t i = 0; i < n; i++) {
+    ss << (int)p2[i];
+  }
+  return ss.str();
+}
