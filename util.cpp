@@ -44,6 +44,10 @@ boost::program_options::variables_map simpleParse(
 }
 
 void checkHugePages(int count) {
+  static int already_checked = 0;
+
+  count = already_checked = (already_checked + count);
+
   int file = open("/proc/sys/vm/nr_hugepages", O_RDWR);
   if (file < 0) {
     die("unable to open /proc/sys/vm/nr_hugepages");
