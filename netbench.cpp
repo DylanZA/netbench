@@ -1215,9 +1215,7 @@ struct IOUringRunner : public RunnerBase {
               sock);
         }
       }
-      if (cqe->res == 0 && TSock::kUseBufferProviderVersion) {
-        buffers_.returnIndex(providedBufferIdx(cqe));
-      }
+
       if (isFixedFiles()) {
         auto* sqe = get_sqe();
         sock->addClose(sqe);
