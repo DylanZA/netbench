@@ -828,12 +828,13 @@ struct BasicSock {
   void addRead(struct io_uring_sqe* sqe, TBufferProvider& provider) {
     if (kUseBufferProviderVersion) {
       size_t const size = kMultiShotRecv ? 0LLU : provider.sizePerBuffer();
-      io_uring_prep_recv(sqe, fd_, NULL, size, 0);
-      sqe->flags |= IOSQE_BUFFER_SELECT;
+
       if (kMultiShotRecv) {
-        // #define IORING_RECV_MULTISHOT	(1U << 1)
-        sqe->addr2 |= (1U << 1);
+        io_uring_prep_recv_multishot(sqe, fd_, NULL, size, 0);
+      } else {
+        io_uring_prep_recv(sqe, fd_, NULL, size, 0);
       }
+      sqe->flags |= IOSQE_BUFFER_SELECT;
       sqe->buf_group = TBufferProvider::kBgid;
     } else {
       io_uring_prep_recv(sqe, fd_, &buff[0], sizeof(buff), 0);
