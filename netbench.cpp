@@ -777,8 +777,6 @@ class BufferProviderV2 : private boost::noncopyable {
 
 static constexpr int kUseBufferProviderFlag = 1;
 static constexpr int kUseBufferProviderV2Flag = 2;
-static constexpr int kUseFixedFilesFlag = 4;
-static constexpr int kMultiShotRecvFlag = 8;
 
 int providedBufferIdx(struct io_uring_cqe* cqe) {
   if (!(cqe->flags & IORING_CQE_F_BUFFER)) {
@@ -793,13 +791,19 @@ struct BasicSock {
       (Flags & kUseBufferProviderV2Flag) ? 2
       : (Flags & kUseBufferProviderFlag) ? 1
                                          : 0;
-  static constexpr bool kUseFixedFiles = Flags & kUseFixedFilesFlag;
-  static constexpr bool kMultiShotRecv = Flags & kMultiShotRecvFlag;
 
   using TBufferProvider = std::conditional_t<
       kUseBufferProviderVersion == 2,
       BufferProviderV2,
       BufferProviderV1>;
+
+  bool isFixedFiles() const {
+    return cfg_.fixed_files;
+  }
+
+  bool isMultiShotRecv() const {
+    return cfg_.multishot_recv;
+  }
 
   explicit BasicSock(IoUringRxConfig const& cfg, int fd) : cfg_(cfg), fd_(fd) {
     if (cfg_.recvmsg) {
@@ -808,7 +812,7 @@ struct BasicSock {
       recvmsgHdr_.msg_iov = &recvmsgHdrIoVec_;
       recvmsgHdrIoVec_.iov_base = &buff[0];
       recvmsgHdrIoVec_.iov_len = ReadSize;
-      if (kMultiShotRecvFlag || kUseBufferProviderVersion > 0) {
+      if (isMultiShotRecv() || kUseBufferProviderVersion > 0) {
         recvmsgHdr_.msg_iovlen = 0;
       } else {
         recvmsgHdr_.msg_iovlen = 1;
@@ -837,7 +841,7 @@ struct BasicSock {
       die("too big send");
     }
     io_uring_prep_send(sqe, fd_, &buff[0], len, 0);
-    if (kUseFixedFiles) {
+    if (isFixedFiles()) {
       sqe->flags |= IOSQE_FIXED_FILE;
     }
     sqe->flags |= IOSQE_CQE_SKIP_SUCCESS;
@@ -846,15 +850,15 @@ struct BasicSock {
 
   void addRead(struct io_uring_sqe* sqe, TBufferProvider& provider) {
     if (kUseBufferProviderVersion) {
-      size_t const size = kMultiShotRecv ? 0LLU : provider.sizePerBuffer();
+      size_t const size = isMultiShotRecv() ? 0LLU : provider.sizePerBuffer();
 
       if (cfg_.recvmsg) {
         io_uring_prep_recvmsg(sqe, fd_, &recvmsgHdr_, 0);
-        if (kMultiShotRecv) {
+        if (isMultiShotRecv()) {
           sqe->ioprio |= IORING_RECV_MULTISHOT;
         }
       } else {
-        if (kMultiShotRecv) {
+        if (isMultiShotRecv()) {
           io_uring_prep_recv_multishot(sqe, fd_, NULL, size, 0);
         } else {
           io_uring_prep_recv(sqe, fd_, NULL, size, 0);
@@ -868,7 +872,7 @@ struct BasicSock {
       io_uring_prep_recv(sqe, fd_, &buff[0], sizeof(buff), 0);
     }
 
-    if (kUseFixedFiles) {
+    if (isFixedFiles()) {
       sqe->flags |= IOSQE_FIXED_FILE;
     }
   }
@@ -884,14 +888,14 @@ struct BasicSock {
 
   void addClose(struct io_uring_sqe* sqe) {
     closed_ = true;
-    if (kUseFixedFiles)
+    if (isFixedFiles())
       io_uring_prep_close_direct(sqe, fd_);
     else
       io_uring_prep_close(sqe, fd_);
   }
 
   int fixAmount(struct io_uring_cqe* cqe, TBufferProvider& provider) {
-    if (!kUseBufferProviderVersion || !kMultiShotRecv || !cfg_.recvmsg) {
+    if (!kUseBufferProviderVersion || !isMultiShotRecv() || !cfg_.recvmsg) {
       return cqe->res;
     }
 
@@ -924,7 +928,7 @@ struct BasicSock {
       int recycleBufferIdx = providedBufferIdx(cqe);
       auto* data = provider.getData(recycleBufferIdx);
 
-      if (kMultiShotRecv && cfg_.recvmsg) {
+      if (isMultiShotRecv() && cfg_.recvmsg) {
         if (recycleBufferIdx < 0) {
           die("bad recycleBufferIdx");
         }
@@ -1005,7 +1009,7 @@ struct IOUringRunner : public RunnerBase {
       submit();
     }
 
-    if (TSock::kUseFixedFiles) {
+    if (isFixedFiles()) {
       std::vector<int> files(rx_cfg.fixed_file_count, -1);
       checkedErrno(
           io_uring_register_files(&ring, files.data(), files.size()),
@@ -1066,7 +1070,7 @@ struct IOUringRunner : public RunnerBase {
       ls->client_len = sizeof(ls->addr);
       addr = (struct sockaddr*)&ls->addr;
     }
-    if (TSock::kUseFixedFiles) {
+    if (isFixedFiles()) {
       if (ls->nextAcceptIdx >= 0) {
         die("only allowed one accept at a time");
       }
@@ -1109,7 +1113,7 @@ struct IOUringRunner : public RunnerBase {
     ListenSock* ls = untag<ListenSock>(cqe->user_data);
     if (fd >= 0) {
       int used_fd = fd;
-      if (TSock::kUseFixedFiles) {
+      if (isFixedFiles()) {
         if (fd > 0) {
           die("trying to use fixed files, but got given an actual fd. "
               "implies that this kernel does not support this feature");
@@ -1135,7 +1139,7 @@ struct IOUringRunner : public RunnerBase {
     if (stopping) {
       return;
     } else {
-      if (rxCfg_.supports_nonblock_accept && !TSock::kUseFixedFiles) {
+      if (rxCfg_.supports_nonblock_accept && !isFixedFiles()) {
         // get any outstanding sockets
         struct sockaddr_in addr;
         struct sockaddr_in6 addr6;
@@ -1161,7 +1165,7 @@ struct IOUringRunner : public RunnerBase {
   void processClose(struct io_uring_cqe* cqe, TSock* sock) {
     int res = cqe->res;
     if (!res || res == -EBADF) {
-      if (TSock::kUseFixedFiles) {
+      if (isFixedFiles()) {
         // recycle index
         acceptFdPool_.push_back(sock->fd());
       }
@@ -1187,7 +1191,7 @@ struct IOUringRunner : public RunnerBase {
         addSend(sock, sends);
       }
       didRead(res.amount);
-      if (!TSock::kMultiShotRecv || !(cqe->flags & IORING_CQE_F_MORE)) {
+      if (!sock->isMultiShotRecv() || !(cqe->flags & IORING_CQE_F_MORE)) {
         addRead(sock);
       }
     } else if (res.amount <= 0) {
@@ -1214,7 +1218,7 @@ struct IOUringRunner : public RunnerBase {
       if (cqe->res == 0 && TSock::kUseBufferProviderVersion) {
         buffers_.returnIndex(providedBufferIdx(cqe));
       }
-      if (TSock::kUseFixedFiles) {
+      if (isFixedFiles()) {
         auto* sqe = get_sqe();
         sock->addClose(sqe);
         io_uring_sqe_set_data(sqe, tag(sock, kOther));
@@ -1418,6 +1422,8 @@ struct IOUringRunner : public RunnerBase {
   static int get_tag(uint64_t ptr) {
     return (int)(ptr & 0x0f);
   }
+
+  bool isFixedFiles() const { return rxCfg_.fixed_files; }
 
   Config cfg_;
   IoUringRxConfig rxCfg_;
@@ -1735,9 +1741,7 @@ Receiver makeIoUringRx(
 
   std::unique_ptr<RunnerBase> runner;
   size_t flags = (rx_cfg.provide_buffers == 1 ? kUseBufferProviderFlag : 0) |
-      (rx_cfg.provide_buffers == 2 ? kUseBufferProviderV2Flag : 0) |
-      (rx_cfg.fixed_files ? kUseFixedFilesFlag : 0) |
-      (rx_cfg.multishot_recv ? kMultiShotRecvFlag : 0);
+      (rx_cfg.provide_buffers == 2 ? kUseBufferProviderV2Flag : 0);
 
   ((mbIoUringRxFactory<PossibleFlag>(
        cfg, rx_cfg, strcat("io_uring port=", port), flags, runner)),
@@ -1954,7 +1958,7 @@ io_uring_desc.add_options()
   switch (engine) {
     case RxEngine::IoUring:
       return [io_uring_cfg](Config const& cfg) -> Receiver {
-        return makeIoUringRx(cfg, io_uring_cfg, std::make_index_sequence<32>{});
+        return makeIoUringRx(cfg, io_uring_cfg, std::make_index_sequence<4>{});
       };
     case RxEngine::Epoll:
       return [epoll_cfg](Config const& cfg) -> Receiver {
