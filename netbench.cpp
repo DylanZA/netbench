@@ -102,6 +102,7 @@ struct IoUringRxConfig : RxConfig {
   int provided_buffer_compact = 1;
   bool huge_pages = false;
   bool multishot_recv = false;
+  bool recvmsg = false;
 
   std::string const toString() const {
     // only give the important options:
@@ -138,7 +139,9 @@ struct IoUringRxConfig : RxConfig {
             : strcat(" huge_pages=", huge_pages),
         is_default(&IoUringRxConfig::multishot_recv)
             ? ""
-            : strcat(" multishot_recv=", multishot_recv));
+            : strcat(" multishot_recv=", multishot_recv),
+        is_default(&IoUringRxConfig::recvmsg) ? ""
+                                              : strcat(" recvmsg=", recvmsg));
   }
 };
 
@@ -778,6 +781,9 @@ static constexpr int kUseFixedFilesFlag = 4;
 static constexpr int kMultiShotRecvFlag = 8;
 
 int providedBufferIdx(struct io_uring_cqe* cqe) {
+  if (!(cqe->flags & IORING_CQE_F_BUFFER)) {
+    return -1;
+  }
   return cqe->flags >> 16;
 }
 
@@ -795,7 +801,20 @@ struct BasicSock {
       BufferProviderV2,
       BufferProviderV1>;
 
-  explicit BasicSock(int fd) : fd_(fd) {}
+  explicit BasicSock(IoUringRxConfig const& cfg, int fd) : cfg_(cfg), fd_(fd) {
+    if (cfg_.recvmsg) {
+      memset(&recvmsgHdr_, 0, sizeof(recvmsgHdr_));
+      memset(&recvmsgHdrIoVec_, 0, sizeof(recvmsgHdrIoVec_));
+      recvmsgHdr_.msg_iov = &recvmsgHdrIoVec_;
+      recvmsgHdrIoVec_.iov_base = &buff[0];
+      recvmsgHdrIoVec_.iov_len = ReadSize;
+      if (kMultiShotRecvFlag || kUseBufferProviderVersion > 0) {
+        recvmsgHdr_.msg_iovlen = 0;
+      } else {
+        recvmsgHdr_.msg_iovlen = 1;
+      }
+    }
+  }
 
   ~BasicSock() {
     if (!closed_) {
@@ -829,13 +848,22 @@ struct BasicSock {
     if (kUseBufferProviderVersion) {
       size_t const size = kMultiShotRecv ? 0LLU : provider.sizePerBuffer();
 
-      if (kMultiShotRecv) {
-        io_uring_prep_recv_multishot(sqe, fd_, NULL, size, 0);
+      if (cfg_.recvmsg) {
+        io_uring_prep_recvmsg(sqe, fd_, &recvmsgHdr_, 0);
+        if (kMultiShotRecv) {
+          sqe->ioprio |= IORING_RECV_MULTISHOT;
+        }
       } else {
-        io_uring_prep_recv(sqe, fd_, NULL, size, 0);
+        if (kMultiShotRecv) {
+          io_uring_prep_recv_multishot(sqe, fd_, NULL, size, 0);
+        } else {
+          io_uring_prep_recv(sqe, fd_, NULL, size, 0);
+        }
       }
       sqe->flags |= IOSQE_BUFFER_SELECT;
       sqe->buf_group = TBufferProvider::kBgid;
+    } else if (cfg_.recvmsg) {
+      io_uring_prep_recvmsg(sqe, fd_, &recvmsgHdr_, 0);
     } else {
       io_uring_prep_recv(sqe, fd_, &buff[0], sizeof(buff), 0);
     }
@@ -862,40 +890,75 @@ struct BasicSock {
       io_uring_prep_close(sqe, fd_);
   }
 
-  int didRead(
-      size_t size,
-      TBufferProvider& provider,
-      struct io_uring_cqe* cqe) {
-    // pull remaining data
-    int res = size;
-    int recycleBufferIdx = -1;
-    if (kUseBufferProviderVersion) {
-      recycleBufferIdx = providedBufferIdx(cqe);
-      didRead(res, provider, recycleBufferIdx);
-    } else {
-      didRead(res);
+  int fixAmount(struct io_uring_cqe* cqe, TBufferProvider& provider) {
+    if (!kUseBufferProviderVersion || !kMultiShotRecv || !cfg_.recvmsg) {
+      return cqe->res;
     }
-    return recycleBufferIdx;
+
+    auto* m = (struct msghdr*)provider.getData(providedBufferIdx(cqe));
+    if (m->msg_iovlen > 1) {
+      die("unexpected iovlen ", m->msg_iovlen);
+    }
+    if (m->msg_iovlen == 0) {
+      return 0;
+    }
+    return m->msg_iov[0].iov_len;
+  }
+
+  struct DidReadResult {
+    explicit DidReadResult(int amount, int idx)
+        : amount(amount), recycleBufferIdx(idx) {}
+
+    int amount;
+    int recycleBufferIdx;
+  };
+
+  DidReadResult didRead(TBufferProvider& provider, struct io_uring_cqe* cqe) {
+    // pull remaining data
+    int res = cqe->res;
+    if (res <= 0) {
+      return DidReadResult(res, -1);
+    }
+
+    if (kUseBufferProviderVersion) {
+      int recycleBufferIdx = providedBufferIdx(cqe);
+      auto* data = provider.getData(recycleBufferIdx);
+
+      if (kMultiShotRecv && cfg_.recvmsg) {
+        if (recycleBufferIdx < 0) {
+          die("bad recycleBufferIdx");
+        }
+        auto* m = (struct msghdr*)data;
+        if (m->msg_iovlen > 1) {
+          die("unexpected iovlen ", m->msg_iovlen);
+        }
+        if (m->msg_iovlen == 0) {
+          return DidReadResult(0, recycleBufferIdx);
+        }
+        res = m->msg_iov[0].iov_len;
+        data = (char const*)m->msg_iov[0].iov_base;
+      }
+
+      didRead(data, res);
+      return DidReadResult(res, recycleBufferIdx);
+    } else {
+      didRead(buff, res);
+      return DidReadResult(res, -1);
+    }
   }
 
  private:
-  void didRead(size_t n) {
-    // normal read from buffer
-    didRead(buff, n);
-  }
-
-  void didRead(size_t n, TBufferProvider& provider, int idx) {
-    // read from a provided buffer
-    didRead(provider.getData(idx), n);
-  }
   void didRead(char const* b, size_t n) {
     do_send += parser.consume(b, n);
   }
 
+  IoUringRxConfig const cfg_;
   int fd_;
   ProtocolParser parser;
   uint32_t do_send = 0;
   bool closed_ = false;
+  struct msghdr recvmsgHdr_;
+  struct iovec recvmsgHdrIoVec_;
 
   char buff[ReadSize];
 };
@@ -1057,7 +1120,7 @@ struct IOUringRunner : public RunnerBase {
         used_fd = ls->nextAcceptIdx;
         ls->nextAcceptIdx = -1;
       }
-      TSock* sock = new TSock(used_fd);
+      TSock* sock = new TSock(rxCfg_, used_fd);
       addRead(sock);
       newSock();
     } else if (!stopping) {
@@ -1086,7 +1149,7 @@ struct IOUringRunner : public RunnerBase {
           } else if (sock_fd == -1) {
             checkedErrno(sock_fd, "accept4");
           }
-          TSock* sock = new TSock(sock_fd);
+          TSock* sock = new TSock(rxCfg_, sock_fd);
           addRead(sock);
           newSock();
         }
@@ -1110,23 +1173,24 @@ struct IOUringRunner : public RunnerBase {
   }
 
   void processRead(struct io_uring_cqe* cqe) {
-    int amount = cqe->res;
     TSock* sock = untag<TSock>(cqe->user_data);
-    if (amount > 0) {
-      int recycleBufferIdx = sock->didRead(amount, buffers_, cqe);
-      if (recycleBufferIdx > 0) {
-        buffers_.returnIndex(recycleBufferIdx);
-        provideBuffers(false);
-      }
+    auto res = sock->didRead(buffers_, cqe);
+
+    if (res.recycleBufferIdx > 0) {
+      buffers_.returnIndex(res.recycleBufferIdx);
+      provideBuffers(false);
+    }
+
+    if (res.amount > 0) {
       if (uint32_t sends = sock->peekSend(); sends > 0) {
         finishedRequests(sends);
         addSend(sock, sends);
       }
-      didRead(amount);
+      didRead(res.amount);
       if (!TSock::kMultiShotRecv || !(cqe->flags & IORING_CQE_F_MORE)) {
         addRead(sock);
       }
-    } else if (amount <= 0) {
+    } else if (res.amount <= 0) {
       if (unlikely(cqe->res == -ENOBUFS)) {
         die("not enough buffers, but will just requeue. so far have ",
             ++enobuffCount_,
@@ -1847,6 +1911,8 @@ io_uring_desc.add_options()
      ->default_value(io_uring_cfg.huge_pages))
   ("multishot_recv",  po::value(&io_uring_cfg.multishot_recv)
      ->default_value(io_uring_cfg.multishot_recv))
+  ("recvmsg",  po::value(&io_uring_cfg.recvmsg)
+     ->default_value(io_uring_cfg.recvmsg))
   ("supports_nonblock_accept",  po::value(&io_uring_cfg.supports_nonblock_accept)
      ->default_value(io_uring_cfg.supports_nonblock_accept))
   ("register_ring",  po::value(&io_uring_cfg.register_ring)
