@@ -18,7 +18,9 @@
 #include <sys/socket.h>
 #include <sys/times.h>
 
+#include "control.h"
 #include "sender.h"
+#include "socket.h"
 #include "util.h"
 
 namespace po = boost::program_options;
@@ -157,6 +159,7 @@ struct EpollRxConfig : RxConfig {};
 
 struct Config {
   std::vector<uint16_t> use_port;
+  uint16_t control_port = 0;
   bool client_only = false;
   bool server_only = false;
   SendOptions send_options;
@@ -166,49 +169,12 @@ struct Config {
   std::vector<std::string> rx;
 };
 
-int mkBasicSock(uint16_t port, bool const isv6, int extra_flags = 0) {
-  struct sockaddr_in serv_addr;
-  struct sockaddr_in6 serv_addr6;
-  int fd = checkedErrno(
-      socket(isv6 ? AF_INET6 : AF_INET, SOCK_STREAM | extra_flags, 0),
-      "make socket v6=",
-      isv6);
-  doSetSockOpt<int>(fd, SOL_SOCKET, SO_REUSEADDR, 1);
-  if (isv6) {
-    doSetSockOpt<int>(fd, IPPROTO_IPV6, IPV6_V6ONLY, 1);
-  }
-  struct sockaddr* paddr;
-  size_t paddrlen;
-  if (isv6) {
-    memset(&serv_addr6, 0, sizeof(serv_addr6));
-    serv_addr6.sin6_family = AF_INET6;
-    serv_addr6.sin6_port = htons(port);
-    serv_addr6.sin6_addr = in6addr_any;
-    paddr = (struct sockaddr*)&serv_addr6;
-    paddrlen = sizeof(serv_addr6);
-  } else {
-    memset(&serv_addr, 0, sizeof(serv_addr));
-    serv_addr.sin_family = AF_INET;
-    serv_addr.sin_port = htons(port);
-    serv_addr.sin_addr.s_addr = htonl(INADDR_ANY);
-    paddr = (struct sockaddr*)&serv_addr;
-    paddrlen = sizeof(serv_addr);
-  }
-  if (bind(fd, paddr, paddrlen)) {
-    int err = errno;
-    close(fd);
-    errno = err;
-    return -1;
-  }
-  return fd;
-}
-
 int mkServerSock(
     RxConfig const& rx_cfg,
     uint16_t port,
     bool const isv6,
     int extra_flags) {
-  int fd = checkedErrno(mkBasicSock(port, isv6, extra_flags));
+  int fd = checkedErrno(mkBoundSock(port, isv6, extra_flags));
   checkedErrno(listen(fd, rx_cfg.backlog), "listen");
   vlog("made sock ", fd, " v6=", isv6, " port=", port);
   return fd;
@@ -1661,13 +1627,13 @@ uint16_t pickPort(Config const& config) {
   for (int i = 0; i < 1000; i++) {
     auto port = startPort++;
     if (v6) {
-      int v6 = mkBasicSock(port, true);
+      int v6 = mkBoundSock(port, true);
       if (v6 < 0) {
         continue;
       }
       close(v6);
     } else {
-      int v4 = mkBasicSock(port, false);
+      int v4 = mkBoundSock(port, false);
       if (v4 < 0) {
         continue;
       }
@@ -1781,6 +1747,7 @@ desc.add_options()
 ("print_rx_stats", po::value(&config.print_rx_stats))
 ("use_port", po::value<std::vector<uint16_t>>(&config.use_port)->multitoken(),
  "what target port")
+("control_port", po::value(&config.control_port))
 ("server_only", po::value(&config.server_only),
  "do not tx locally, wait for it")
 ("client_only", po::value(&config.client_only),
@@ -2030,23 +1997,44 @@ int main(int argc, char** argv) {
   Config const cfg = parse(argc, argv);
   signal(SIGINT, intHandler);
   std::vector<std::function<Receiver()>> receiver_factories;
+  std::unique_ptr<IControlServer> control_server;
   for (auto const& rx : cfg.rx) {
     receiver_factories.push_back(
         [&cfg, parsed = parseRx(rx)]() -> Receiver { return parsed(cfg); });
   }
 
   if (cfg.client_only) {
-    if (cfg.use_port.empty()) {
+    std::unordered_map<uint16_t, std::string> port_name_map;
+    std::vector<uint16_t> used_ports = cfg.use_port;
+    if (cfg.control_port) {
+      port_name_map = getPortNameMap(
+          cfg.send_options.host, cfg.control_port, cfg.send_options.ipv6);
+      if (used_ports.empty()) {
+        log("taking all ports from server");
+        for (auto const& kv : port_name_map) {
+          used_ports.push_back(kv.first);
+        }
+        std::sort(used_ports.begin(), used_ports.end());
+      }
+    }
+    if (used_ports.empty()) {
       die("please specify port for client_only");
     }
     receiver_factories.clear();
     log("using given ports not setting up local receivers");
-    for (auto port : cfg.use_port) {
-      receiver_factories.push_back([port]() -> Receiver {
+    for (auto port : used_ports) {
+      receiver_factories.push_back([port, port_name_map]() -> Receiver {
+        auto it = port_name_map.find(port);
+        std::string name;
+        if (it == port_name_map.end()) {
+          name = strcat("given_port port=", port);
+        } else {
+          name = it->second;
+        }
         return Receiver{
             std::make_unique<NullRunner>(strcat("null port=", port)),
             port,
-            strcat("given_port port=", port)};
+            std::move(name)};
       });
     }
   }
@@ -2077,7 +2065,8 @@ int main(int argc, char** argv) {
         rcv_thread.join();
         log("...done receiver");
         results.emplace_back(
-            strcat(tx, "_", rcv.name, "_", rcv.rxCfg), std::move(res));
+            strcat("tx:", tx, " rx:", rcv.name, " ", rcv.rxCfg),
+            std::move(res));
       }
     }
 
@@ -2109,7 +2098,7 @@ int main(int argc, char** argv) {
       if (kv.second.size() <= 1) {
         continue;
       }
-      log("aggregated_", kv.first);
+      log("aggregated:  ", kv.first);
       log(std::string(30, ' '),
           aggregateResults(std::move(kv.second)).toString());
     }
@@ -2119,12 +2108,20 @@ int main(int argc, char** argv) {
     std::atomic<bool> should_shutdown{false};
     std::vector<Receiver> receivers;
     std::vector<std::thread> receiver_threads;
+    std::unordered_map<uint16_t, std::string>
+        server_port_name_map;
     for (auto& r : receiver_factories) {
       receivers.push_back(r());
     }
     log("using receivers: ");
     for (auto const& r : receivers) {
       log(r.name, " port=", r.port, " rx_cfg=", r.rxCfg);
+      server_port_name_map[r.port] = strcat(r.name, " ", r.rxCfg);
+    }
+
+    if (cfg.control_port) {
+      control_server = makeControlServer(
+          server_port_name_map, cfg.control_port, cfg.send_options.ipv6);
     }
 
     for (auto& r : receivers) {

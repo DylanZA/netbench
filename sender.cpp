@@ -16,6 +16,8 @@
 #include <sys/socket.h>
 #include <sys/types.h>
 
+#include "socket.h"
+
 namespace po = boost::program_options;
 using TClock = std::chrono::steady_clock;
 enum class ActionOp {
@@ -592,29 +594,6 @@ struct SendBuffers {
   std::vector<char> buff_;
 };
 
-static int parse_ip6_addr(const char* str_addr, struct sockaddr_in6* sockaddr) {
-  struct addrinfo hints;
-  struct addrinfo* result;
-  int ret;
-
-  memset(&hints, 0, sizeof(hints));
-  hints.ai_family = AF_INET6;
-  hints.ai_flags = AI_NUMERICHOST | AI_PASSIVE;
-  ret = getaddrinfo(str_addr, NULL, &hints, &result);
-  if (!ret) {
-    *sockaddr = *(struct sockaddr_in6*)result->ai_addr;
-    freeaddrinfo(result);
-    return 0;
-  }
-  log("getaddrinfo(",
-      str_addr,
-      " ) failed with err=",
-      ret,
-      " : ",
-      gai_strerror(ret));
-  return -1;
-}
-
 class ISender {
  public:
   virtual ~ISender() = default;
@@ -1144,32 +1123,7 @@ void getAddress(
     uint16_t port,
     struct sockaddr_storage* addr,
     socklen_t* addrLen) {
-  std::string dest = options.host;
-  if (options.ipv6) {
-    struct sockaddr_in6* addr6 = (struct sockaddr_in6*)addr;
-    *addrLen = sizeof(*addr6);
-    memset(addr6, 0, sizeof(*addr6));
-    if (dest.empty()) {
-      dest = "::1";
-    }
-    if (parse_ip6_addr(dest.c_str(), addr6)) {
-      die("ipv6 parse error: ", dest);
-    }
-    addr6->sin6_family = PF_INET6;
-    addr6->sin6_port = htons(port);
-  } else {
-    struct sockaddr_in* addr4 = (struct sockaddr_in*)addr;
-    *addrLen = sizeof(*addr4);
-    memset(addr4, 0, sizeof(*addr4));
-    addr4->sin_family = AF_INET;
-    addr4->sin_port = htons(port);
-    if (dest.empty()) {
-      dest = "127.0.1.1";
-    }
-    if (inet_pton(AF_INET, dest.c_str(), &(addr4->sin_addr)) != 1) {
-      die("ipv4 parse error:", dest);
-    }
-  }
+  getAddress(options.host, options.ipv6, port, addr, addrLen);
 }
 
 struct EpollConnection {
