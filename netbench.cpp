@@ -86,6 +86,16 @@ struct RxConfig {
   int backlog = 100000;
   int max_events = 32;
   int recv_size = 4096;
+  bool recvmsg = false;
+  std::string const toString() const {
+    // only give the important options:
+    auto is_default = [this](auto RxConfig::*x) {
+      RxConfig base;
+      return this->*x == base.*x;
+    };
+    return strcat(
+        is_default(&RxConfig::recvmsg) ? "" : strcat(" recvmsg=", recvmsg));
+  }
 };
 
 struct IoUringRxConfig : RxConfig {
@@ -102,7 +112,6 @@ struct IoUringRxConfig : RxConfig {
   int provided_buffer_compact = 1;
   bool huge_pages = false;
   bool multishot_recv = false;
-  bool recvmsg = false;
 
   std::string const toString() const {
     // only give the important options:
@@ -111,7 +120,8 @@ struct IoUringRxConfig : RxConfig {
       return this->*x == base.*x;
     };
     return strcat(
-        "fixed_files=",
+        RxConfig::toString(),
+        " fixed_files=",
         fixed_files ? strcat("1 (count=", fixed_file_count, ")") : strcat("0"),
         " provide_buffers=",
         provide_buffers ? strcat(
@@ -139,9 +149,7 @@ struct IoUringRxConfig : RxConfig {
             : strcat(" huge_pages=", huge_pages),
         is_default(&IoUringRxConfig::multishot_recv)
             ? ""
-            : strcat(" multishot_recv=", multishot_recv),
-        is_default(&IoUringRxConfig::recvmsg) ? ""
-                                              : strcat(" recvmsg=", recvmsg));
+            : strcat(" multishot_recv=", multishot_recv));
   }
 };
 
@@ -894,21 +902,6 @@ struct BasicSock {
       io_uring_prep_close(sqe, fd_);
   }
 
-  int fixAmount(struct io_uring_cqe* cqe, TBufferProvider& provider) {
-    if (!kUseBufferProviderVersion || !isMultiShotRecv() || !cfg_.recvmsg) {
-      return cqe->res;
-    }
-
-    auto* m = (struct msghdr*)provider.getData(providedBufferIdx(cqe));
-    if (m->msg_iovlen > 1) {
-      die("unexpected iovlen ", m->msg_iovlen);
-    }
-    if (m->msg_iovlen == 0) {
-      return 0;
-    }
-    return m->msg_iov[0].iov_len;
-  }
-
   struct DidReadResult {
     explicit DidReadResult(int amount, int idx)
         : amount(amount), recycleBufferIdx(idx) {}
@@ -1421,7 +1414,9 @@ struct IOUringRunner : public RunnerBase {
     return (int)(ptr & 0x0f);
   }
 
-  bool isFixedFiles() const { return rxCfg_.fixed_files; }
+  bool isFixedFiles() const {
+    return rxCfg_.fixed_files;
+  }
 
   Config cfg_;
   IoUringRxConfig rxCfg_;
@@ -1458,6 +1453,13 @@ struct EPollRunner : public RunnerBase {
     epoll_fd = checkedErrno(epoll_create(rx_cfg.max_events), "epoll_create");
     rcvbuff.resize(rx_cfg.recv_size);
     events.resize(rx_cfg.max_events);
+
+    memset(&recvmsgHdr_, 0, sizeof(recvmsgHdr_));
+    memset(&recvmsgHdrIoVec_, 0, sizeof(recvmsgHdrIoVec_));
+    recvmsgHdr_.msg_iov = &recvmsgHdrIoVec_;
+    recvmsgHdr_.msg_iovlen = 1;
+    recvmsgHdrIoVec_.iov_base = rcvbuff.data();
+    recvmsgHdrIoVec_.iov_len = rcvbuff.size();
   }
 
   ~EPollRunner() {
@@ -1541,7 +1543,11 @@ struct EPollRunner : public RunnerBase {
     int res;
     int fd = ed->fd;
     do {
-      res = recv(fd, rcvbuff.data(), rcvbuff.size(), MSG_NOSIGNAL);
+      if (rxCfg_.recvmsg) {
+        res = recvmsg(fd, &recvmsgHdr_, MSG_NOSIGNAL);
+      } else {
+        res = recv(fd, rcvbuff.data(), rcvbuff.size(), MSG_NOSIGNAL);
+      }
       if (res <= 0) {
         int errnum = errno;
         if (res < 0 && errnum == EAGAIN) {
@@ -1641,6 +1647,8 @@ struct EPollRunner : public RunnerBase {
   std::vector<char> rcvbuff;
   std::vector<std::unique_ptr<EPollData>> listeners_;
   std::unordered_set<EPollData*> sockets_;
+  struct msghdr recvmsgHdr_;
+  struct iovec recvmsgHdrIoVec_;
 };
 
 uint16_t pickPort(Config const& config) {
@@ -1700,7 +1708,7 @@ Receiver makeEpollRx(Config const& cfg, EpollRxConfig const& rx_cfg) {
   runner->addListenSock(
       mkServerSock(rx_cfg, port, cfg.send_options.ipv6, SOCK_NONBLOCK),
       cfg.send_options.ipv6);
-  return Receiver{std::move(runner), port, "epoll", ""};
+  return Receiver{std::move(runner), port, "epoll", rx_cfg.toString()};
 }
 
 template <size_t flags>
@@ -1896,6 +1904,7 @@ auto add_base = [&](po::options_description& d, RxConfig& cfg) {
 ("backlog", po::value(&cfg.backlog)->default_value(cfg.backlog))
 ("max_events", po::value(&cfg.max_events)->default_value(cfg.max_events))
 ("recv_size", po::value(&cfg.recv_size)->default_value(cfg.recv_size))
+("recvmsg",  po::value(&cfg.recvmsg)->default_value(cfg.recvmsg))
   ;
 };
 
