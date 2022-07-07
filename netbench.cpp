@@ -123,20 +123,19 @@ struct IoUringRxConfig : RxConfig {
     };
     return strcat(
         RxConfig::toString(),
-        " fixed_files=",
-        fixed_files ? strcat("1 (count=", fixed_file_count, ")") : strcat("0"),
-        " provide_buffers=",
-        provide_buffers ? strcat(
-                              "v=",
-                              provide_buffers,
-                              " (count=",
-                              provided_buffer_count,
-                              " refill=",
-                              provided_buffer_low_watermark,
-                              " compact=",
-                              provided_buffer_compact,
-                              ")")
-                        : strcat("0"),
+        (!is_default(&IoUringRxConfig::fixed_files) ||
+         !is_default(&IoUringRxConfig::fixed_file_count))
+            ? strcat(
+                  " fixed_files=",
+                  fixed_files ? strcat("1 (count=", fixed_file_count, ")")
+                              : strcat("0"))
+            : "",
+        is_default(&IoUringRxConfig::provide_buffers)
+            ? ""
+            : strcat(" provide_buffers=", provide_buffers),
+        is_default(&IoUringRxConfig::provided_buffer_count)
+            ? ""
+            : strcat(" provided_buffer_count=", provided_buffer_count),
         is_default(&IoUringRxConfig::sqe_count)
             ? ""
             : strcat(" sqe_count=", sqe_count),
@@ -2108,8 +2107,7 @@ int main(int argc, char** argv) {
     std::atomic<bool> should_shutdown{false};
     std::vector<Receiver> receivers;
     std::vector<std::thread> receiver_threads;
-    std::unordered_map<uint16_t, std::string>
-        server_port_name_map;
+    std::unordered_map<uint16_t, std::string> server_port_name_map;
     for (auto& r : receiver_factories) {
       receivers.push_back(r());
     }
