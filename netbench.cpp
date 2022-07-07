@@ -97,7 +97,16 @@ struct RxConfig {
   int max_events = 32;
   int recv_size = 4096;
   bool recvmsg = false;
-  std::string const toString() const {
+  std::string description;
+
+  std::string describe() const {
+    if (description.empty()) {
+      return toString();
+    }
+    return description;
+  }
+
+  virtual std::string const toString() const {
     // only give the important options:
     auto is_default = [this](auto RxConfig::*x) {
       RxConfig base;
@@ -123,7 +132,7 @@ struct IoUringRxConfig : RxConfig {
   bool huge_pages = false;
   int multishot_recv = 0;
 
-  std::string const toString() const {
+  std::string const toString() const override {
     // only give the important options:
     auto is_default = [this](auto IoUringRxConfig::*x) {
       IoUringRxConfig base;
@@ -1695,7 +1704,7 @@ Receiver makeEpollRx(Config const& cfg, EpollRxConfig const& rx_cfg) {
   runner->addListenSock(
       mkServerSock(rx_cfg, port, cfg.send_options.ipv6, SOCK_NONBLOCK),
       cfg.send_options.ipv6);
-  return Receiver{std::move(runner), port, "epoll", rx_cfg.toString()};
+  return Receiver{std::move(runner), port, "epoll", rx_cfg.describe()};
 }
 
 template <size_t flags>
@@ -1754,7 +1763,7 @@ Receiver makeIoUringRx(
       mkServerSock(rx_cfg, port, cfg.send_options.ipv6, sock_flags),
       cfg.send_options.ipv6);
 
-  return Receiver{std::move(runner), port, "io_uring", rx_cfg.toString()};
+  return Receiver{std::move(runner), port, "io_uring", rx_cfg.describe()};
 }
 
 Config parse(int argc, char** argv) {
@@ -1893,6 +1902,7 @@ auto add_base = [&](po::options_description& d, RxConfig& cfg) {
 ("max_events", po::value(&cfg.max_events)->default_value(cfg.max_events))
 ("recv_size", po::value(&cfg.recv_size)->default_value(cfg.recv_size))
 ("recvmsg",  po::value(&cfg.recvmsg)->default_value(cfg.recvmsg))
+("description",  po::value(&cfg.description))
   ;
 };
 
