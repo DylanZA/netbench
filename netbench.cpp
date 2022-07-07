@@ -59,6 +59,14 @@ static inline int ____sys_io_uring_enter2(
   return (ret < 0) ? -errno : ret;
 }
 
+#define __IORING_RECVMSG_MULTISHOT_V2 (1U << 2)
+struct __io_uring_recvmsg_out {
+  __u32 namelen;
+  __u32 controllen;
+  __u32 payloadlen;
+  int flags;
+};
+
 } // namespace
 
 /*
@@ -113,7 +121,7 @@ struct IoUringRxConfig : RxConfig {
   int provided_buffer_low_watermark = -1;
   int provided_buffer_compact = 1;
   bool huge_pages = false;
-  bool multishot_recv = false;
+  int multishot_recv = 0;
 
   std::string const toString() const {
     // only give the important options:
@@ -830,6 +838,9 @@ struct BasicSock {
         if (isMultiShotRecv()) {
           sqe->ioprio |= IORING_RECV_MULTISHOT;
         }
+        if (cfg_.multishot_recv == 2) {
+          sqe->ioprio |= __IORING_RECVMSG_MULTISHOT_V2;
+        }
       } else {
         if (isMultiShotRecv()) {
           io_uring_prep_recv_multishot(sqe, fd_, NULL, size, 0);
@@ -890,15 +901,26 @@ struct BasicSock {
         if (recycleBufferIdx < 0) {
           die("bad recycleBufferIdx");
         }
-        auto* m = (struct msghdr*)data;
-        if (m->msg_iovlen > 1) {
-          die("unexpected iovlen ", m->msg_iovlen);
+        if (!data)
+          die("bad data");
+        if (cfg_.multishot_recv == 2) {
+          auto* m = (struct __io_uring_recvmsg_out*)data;
+          if (m->payloadlen == 0) {
+            return DidReadResult(0, recycleBufferIdx);
+          }
+          res = m->payloadlen;
+          data = data + sizeof(struct __io_uring_recvmsg_out);
+        } else {
+          auto* m = (struct msghdr*)data;
+          if (m->msg_iovlen > 1) {
+            die("unexpected iovlen ", m->msg_iovlen);
+          }
+          if (m->msg_iovlen == 0) {
+            return DidReadResult(0, recycleBufferIdx);
+          }
+          res = m->msg_iov[0].iov_len;
+          data = (char const*)m->msg_iov[0].iov_base;
         }
-        if (m->msg_iovlen == 0) {
-          return DidReadResult(0, recycleBufferIdx);
-        }
-        res = m->msg_iov[0].iov_len;
-        data = (char const*)m->msg_iov[0].iov_base;
       }
 
       didRead(data, res);
@@ -1888,8 +1910,6 @@ io_uring_desc.add_options()
      ->default_value(io_uring_cfg.huge_pages))
   ("multishot_recv",  po::value(&io_uring_cfg.multishot_recv)
      ->default_value(io_uring_cfg.multishot_recv))
-  ("recvmsg",  po::value(&io_uring_cfg.recvmsg)
-     ->default_value(io_uring_cfg.recvmsg))
   ("supports_nonblock_accept",  po::value(&io_uring_cfg.supports_nonblock_accept)
      ->default_value(io_uring_cfg.supports_nonblock_accept))
   ("register_ring",  po::value(&io_uring_cfg.register_ring)
