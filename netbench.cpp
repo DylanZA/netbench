@@ -58,14 +58,6 @@ static inline int ____sys_io_uring_enter2(
   return (ret < 0) ? -errno : ret;
 }
 
-#define __IORING_RECVMSG_MULTISHOT_V2 (1U << 2)
-struct __io_uring_recvmsg_out {
-  __u32 namelen;
-  __u32 controllen;
-  __u32 payloadlen;
-  int flags;
-};
-
 } // namespace
 
 /*
@@ -846,9 +838,6 @@ struct BasicSock {
         if (isMultiShotRecv()) {
           sqe->ioprio |= IORING_RECV_MULTISHOT;
         }
-        if (cfg_.multishot_recv == 2) {
-          sqe->ioprio |= __IORING_RECVMSG_MULTISHOT_V2;
-        }
       } else {
         if (isMultiShotRecv()) {
           io_uring_prep_recv_multishot(sqe, fd_, NULL, size, 0);
@@ -909,26 +898,15 @@ struct BasicSock {
         if (recycleBufferIdx < 0) {
           die("bad recycleBufferIdx");
         }
-        if (!data)
+        if (!data) {
           die("bad data");
-        if (cfg_.multishot_recv == 2) {
-          auto* m = (struct __io_uring_recvmsg_out*)data;
-          if (m->payloadlen == 0) {
-            return DidReadResult(0, recycleBufferIdx);
-          }
-          res = m->payloadlen;
-          data = data + sizeof(struct __io_uring_recvmsg_out);
-        } else {
-          auto* m = (struct msghdr*)data;
-          if (m->msg_iovlen > 1) {
-            die("unexpected iovlen ", m->msg_iovlen);
-          }
-          if (m->msg_iovlen == 0) {
-            return DidReadResult(0, recycleBufferIdx);
-          }
-          res = m->msg_iov[0].iov_len;
-          data = (char const*)m->msg_iov[0].iov_base;
         }
+        auto* m = io_uring_recvmsg_validate((void*)data, res, &recvmsgHdr_);
+        if (!m) {
+            return DidReadResult(0, recycleBufferIdx);
+        }
+        res = io_uring_recvmsg_payload_length(m, cqe->res, &recvmsgHdr_);
+        data = (const char*)io_uring_recvmsg_payload(m, &recvmsgHdr_);
       }
 
       didRead(data, res);
