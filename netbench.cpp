@@ -26,7 +26,6 @@
 namespace po = boost::program_options;
 
 namespace {
-static constexpr uint32_t __IORING_SETUP_COOP_TASKRUN = (1U << 8);
 
 #ifndef __NR_io_uring_enter
 static constexpr int __NR_io_uring_enter = 426;
@@ -207,7 +206,7 @@ struct io_uring mkIoUring(IoUringRxConfig const& rx_cfg) {
       rx_cfg.cqe_count <= 0 ? 8 * rx_cfg.sqe_count : rx_cfg.cqe_count;
 
   unsigned int newer_flags =
-      IORING_SETUP_SUBMIT_ALL | __IORING_SETUP_COOP_TASKRUN;
+      IORING_SETUP_SUBMIT_ALL | IORING_SETUP_COOP_TASKRUN;
   params.flags |= IORING_SETUP_CQSIZE;
   params.cq_entries = cqe_count;
   int ret = io_uring_queue_init_params(rx_cfg.sqe_count, &ring, &params);
