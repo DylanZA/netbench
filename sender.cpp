@@ -1367,6 +1367,9 @@ runSender(std::string const& test, SendOptions const& options, uint16_t port) {
     if (test == "epoll") {
       sender = std::make_unique<EpollSender>(
           options, port, ready_barrier, options.small_size);
+    } else if (test == "epoll_medium") {
+      sender = std::make_unique<EpollSender>(
+          options, port, ready_barrier, options.medium_size);
     } else if (test == "epoll_large") {
       sender = std::make_unique<EpollSender>(
           options, port, ready_barrier, options.large_size);
