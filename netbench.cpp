@@ -88,6 +88,7 @@ struct RxConfig {
   int max_events = 32;
   int recv_size = 4096;
   bool recvmsg = false;
+  size_t workload = 0;
   std::string description;
 
   std::string describe() const {
@@ -104,7 +105,8 @@ struct RxConfig {
       return this->*x == base.*x;
     };
     return strcat(
-        is_default(&RxConfig::recvmsg) ? "" : strcat(" recvmsg=", recvmsg));
+        is_default(&RxConfig::recvmsg) ? "" : strcat(" recvmsg=", recvmsg),
+        is_default(&RxConfig::workload) ? "" : strcat(" workload=", workload));
   }
 };
 
@@ -214,6 +216,19 @@ struct io_uring mkIoUring(IoUringRxConfig const& rx_cfg) {
     checkedErrno(io_uring_register_ring_fd(&ring), "register ring fd");
   }
   return ring;
+}
+
+std::atomic<int> gInt{0};
+void runWorkload(RxConfig const& cfg, uint32_t consumed) {
+  if (!cfg.workload)
+    return;
+  for (uint32_t i = 0; i < consumed; i++) {
+    for (size_t j = 0; j < cfg.workload * 1000; j++) {
+      if (gInt.load()) {
+        std::terminate();
+      }
+    }
+  }
 }
 
 // benchmark protocol is <uint32_t length>:<payload of size length>
@@ -903,7 +918,7 @@ struct BasicSock {
         }
         auto* m = io_uring_recvmsg_validate((void*)data, res, &recvmsgHdr_);
         if (!m) {
-            return DidReadResult(0, recycleBufferIdx);
+          return DidReadResult(0, recycleBufferIdx);
         }
         res = io_uring_recvmsg_payload_length(m, cqe->res, &recvmsgHdr_);
         data = (const char*)io_uring_recvmsg_payload(m, &recvmsgHdr_);
@@ -919,7 +934,9 @@ struct BasicSock {
 
  private:
   void didRead(char const* b, size_t n) {
-    do_send += parser.consume(b, n);
+    uint32_t consumed = parser.consume(b, n);
+    runWorkload(cfg_, consumed);
+    do_send += consumed;
   }
 
   IoUringRxConfig const cfg_;
@@ -1543,7 +1560,8 @@ struct EPollRunner : public RunnerBase {
         return -1;
       } else {
         didRead(res);
-        int consumed = ed->parser.consume(rcvbuff.data(), res);
+        uint32_t consumed = ed->parser.consume(rcvbuff.data(), res);
+        runWorkload(rxCfg_, consumed);
         finishedRequests(consumed);
         ed->to_write += consumed;
       }
@@ -1879,6 +1897,7 @@ auto add_base = [&](po::options_description& d, RxConfig& cfg) {
 ("max_events", po::value(&cfg.max_events)->default_value(cfg.max_events))
 ("recv_size", po::value(&cfg.recv_size)->default_value(cfg.recv_size))
 ("recvmsg",  po::value(&cfg.recvmsg)->default_value(cfg.recvmsg))
+("workload",  po::value(&cfg.workload)->default_value(cfg.workload))
 ("description",  po::value(&cfg.description))
   ;
 };
