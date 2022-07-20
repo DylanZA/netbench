@@ -186,7 +186,7 @@ struct Config {
   uint16_t control_port = 0;
   bool client_only = false;
   bool server_only = false;
-  SendOptions send_options;
+  GlobalSendOptions send_options;
 
   bool print_rx_stats = true;
   std::vector<std::string> tx;
@@ -1819,19 +1819,10 @@ desc.add_options()
 ("host", po::value(&config.send_options.host))
 ("v6", po::value(&config.send_options.ipv6))
 ("time", po::value(&config.send_options.run_seconds))
-("send_threads", po::value(&config.send_options.threads)
-   ->default_value(config.send_options.threads),
-  "number of sender threads")
-("send_connections_per_thread", po::value(&config.send_options.per_thread)
-   ->default_value(config.send_options.per_thread),
-   "send: number of connections made per sender thread")
 ("tx", po::value<std::vector<std::string> >()->multitoken(),
  "tx scenarios to run (can be multiple)")
 ("rx", po::value<std::vector<std::string> >()->multitoken(),
  "rx engines to run (can be multiple)")
-("send_small_size", po::value(&config.send_options.small_size))
-("send_medium_size", po::value(&config.send_options.medium_size))
-("send_large_size", po::value(&config.send_options.large_size))
 ;
   // clang-format on
 
@@ -1856,6 +1847,9 @@ desc.add_options()
         auto all = allScenarios();
         config.tx.insert(config.tx.end(), all.begin(), all.end());
       } else {
+        // quick exit for --help
+        PerSendOptions::parseOptions(tx);
+
         config.tx.push_back(tx);
       }
     }
@@ -2109,11 +2103,6 @@ int main(int argc, char** argv) {
 
   std::vector<std::pair<std::string, SendResults>> results;
   if (cfg.tx.size()) {
-    log("sending using ",
-        cfg.send_options.threads,
-        " threads, ",
-        cfg.send_options.per_thread,
-        " per thread");
 
     for (auto const& tx : cfg.tx) {
       for (auto const& r : receiver_factories) {

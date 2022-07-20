@@ -7,18 +7,21 @@
 
 #include "util.h"
 
-struct SendOptions {
-  int threads = 4;
-  int per_thread = 64;
-  size_t small_size = 64;
-  size_t medium_size = 1200;
-  size_t large_size = 64000;
+struct GlobalSendOptions {
   bool zero_send_buf = true;
   float run_seconds = 5;
   int maxOutstanding = 16000;
-
+  size_t response_size = 1;
   std::string host;
   bool ipv6 = true;
+};
+
+struct PerSendOptions {
+  int threads = 4;
+  int per_thread = 64;
+  size_t size = 64;
+  size_t resp = 1;
+  static std::pair<std::string, PerSendOptions> parseOptions(std::string const& tx);
 };
 
 struct LatencyResult {
@@ -91,6 +94,6 @@ struct SendResults {
 };
 
 SendResults
-runSender(std::string const& test, SendOptions const& options, uint16_t port);
+runSender(std::string const& test, GlobalSendOptions const& options, uint16_t port);
 
 std::vector<std::string> allScenarios();

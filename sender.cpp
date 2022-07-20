@@ -506,12 +506,8 @@ class BurstySendPeriodic : public BenchmarkScenarioBase {
 
 std::vector<std::string> allScenarios() {
   return {
-      "large",
-      "small",
-      "medium",
-      "single_large",
-      "single_small",
-      "single_medium",
+      "io_uring",
+      "io_uring_single",
       "burst",
       "burst_periodic",
   };
@@ -519,37 +515,31 @@ std::vector<std::string> allScenarios() {
 
 std::unique_ptr<IBenchmarkScenario> makeScenario(
     std::string const& test_args,
-    SendOptions const& options) {
+    GlobalSendOptions const& options,
+    PerSendOptions const& per_options) {
   auto split = po::split_unix(test_args);
   if (split.size() < 1) {
     die("no scenario in ", test_args);
   }
   auto const& test = split[0];
   std::unique_ptr<IBenchmarkScenario> ret;
-  if (test == "large") {
+  if (per_options.resp != 1) {
+    die("io_uring tx only supports 1 size response");
+  }
+
+  if (test == "io_uring") {
     ret = std::make_unique<ConnectSendLots>(
-        options.per_thread, options.large_size);
-  } else if (test == "medium") {
-    ret = std::make_unique<ConnectSendLots>(
-        options.per_thread, options.medium_size);
-  } else if (test == "small") {
-    ret = std::make_unique<ConnectSendLots>(
-        options.per_thread, options.small_size);
-  } else if (test == "single_large") {
+        per_options.per_thread, per_options.size);
+  } else if (test == "io_uring_single") {
     ret = std::make_unique<ConnectSendDisconnect>(
-        options.per_thread, options.large_size);
-  } else if (test == "single_medium") {
-    ret = std::make_unique<ConnectSendDisconnect>(
-        options.per_thread, options.medium_size);
-  } else if (test == "single_small") {
-    ret = std::make_unique<ConnectSendDisconnect>(
-        options.per_thread, options.small_size);
+        per_options.per_thread, per_options.size);
   } else if (test == "burst") {
-    ret = std::make_unique<BurstySend>(options.per_thread, options.small_size);
+    ret =
+        std::make_unique<BurstySend>(per_options.per_thread, per_options.size);
   } else if (test == "burst_periodic") {
     ret = std::make_unique<BurstySendPeriodic>(
-        options.per_thread,
-        options.small_size,
+        per_options.per_thread,
+        per_options.size,
         std::chrono::microseconds(1000));
   } else {
     die("unknown test ", test_args);
@@ -584,9 +574,8 @@ struct Connection {
 };
 
 struct SendBuffers {
-  explicit SendBuffers(SendOptions const& options) {
-    buff_.resize(std::max(
-        options.small_size, std::max(options.medium_size, options.large_size)));
+  explicit SendBuffers(size_t size) {
+    buff_.resize(size);
   }
   std::vector<char> const& buff() const {
     return buff_;
@@ -604,13 +593,15 @@ class Sender : public ISender {
  public:
   Sender(
       std::string const& test,
-      SendOptions const& options,
+      GlobalSendOptions const& options,
+      PerSendOptions const& per_options,
       SendBuffers const& buffers,
       uint16_t port,
       boost::barrier& ready_barrier)
       : cfg_(options),
+        perCfg_(per_options),
         buffers(buffers),
-        scenario(makeScenario(test, options)),
+        scenario(makeScenario(test, options, per_options)),
         ready_barrier(ready_barrier) {
     struct io_uring_params params;
     memset(&params, 0, sizeof(params));
@@ -1098,7 +1089,8 @@ class Sender : public ISender {
     std::vector<uint64_t> connections;
   };
 
-  SendOptions const cfg_;
+  GlobalSendOptions const cfg_;
+  PerSendOptions const perCfg_;
   SendBuffers const& buffers;
   std::unique_ptr<IBenchmarkScenario> scenario;
   boost::barrier& ready_barrier;
@@ -1122,7 +1114,7 @@ class Sender : public ISender {
 };
 
 void getAddress(
-    SendOptions const& options,
+    GlobalSendOptions const& options,
     uint16_t port,
     struct sockaddr_storage* addr,
     socklen_t* addrLen) {
@@ -1158,13 +1150,17 @@ class EpollSender : public ISender {
  public:
   std::vector<char> buff;
   EpollSender(
-      SendOptions const& options,
+      GlobalSendOptions const& options,
+      PerSendOptions const& per_opts,
       uint16_t port,
       boost::barrier& ready_barrier,
       uint32_t size)
-      : cfg_(options), ready_barrier(ready_barrier) {
+      : cfg_(options), perCfg_(per_opts), ready_barrier(ready_barrier) {
+    if (per_opts.resp != 1) {
+      die("epoll tx only supports 1 size response");
+    }
     getAddress(options, port, &addr_, &addrLen_);
-    latencies_.reserve(cfg_.per_thread * 10000);
+    latencies_.reserve(perCfg_.per_thread * 10000);
     epollFd_ = checkedErrno(epoll_create(2048), "epoll_create");
 
     // prep buffer
@@ -1218,7 +1214,7 @@ class EpollSender : public ISender {
   }
 
   void doConnect() {
-    for (int i = 0; i < cfg_.per_thread; i++) {
+    for (int i = 0; i < perCfg_.per_thread; i++) {
       if (addConnection()) {
         successConnects_++;
       } else {
@@ -1344,7 +1340,8 @@ class EpollSender : public ISender {
     }
   }
 
-  SendOptions const cfg_;
+  GlobalSendOptions const cfg_;
+  PerSendOptions const perCfg_;
   boost::barrier& ready_barrier;
   struct sockaddr_storage addr_;
   socklen_t addrLen_;
@@ -1360,30 +1357,54 @@ class EpollSender : public ISender {
   size_t successConnects_ = 0;
 };
 
-SendResults
-runSender(std::string const& test, SendOptions const& options, uint16_t port) {
-  SendBuffers buffers{options};
+std::pair<std::string, PerSendOptions> PerSendOptions::parseOptions(
+    std::string const& tx) {
+  PerSendOptions cfg;
+  po::options_description desc;
+
+  // clang-format off
+  desc.add_options()
+("threads", po::value(&cfg.threads)->default_value(cfg.threads))
+("per_thread", po::value(&cfg.per_thread)->default_value(cfg.per_thread))
+("size", po::value(&cfg.size)->default_value(cfg.size))
+("resp", po::value(&cfg.resp)->default_value(cfg.resp))
+  ;
+  // clang-format on
+
+  auto splits = po::split_unix(tx);
+  if (splits.size() < 1) {
+    die("no engine in ", tx);
+  }
+  auto e = splits[0];
+
+  simpleParse(desc, splits);
+
+  return std::make_pair(e, cfg);
+}
+
+SendResults runSender(
+    std::string const& test,
+    GlobalSendOptions const& options,
+    uint16_t port) {
+  auto [engine, per_opts] = PerSendOptions::parseOptions(test);
+
+  auto buffers = std::make_shared<SendBuffers>(per_opts.size);
   std::vector<SendResults> results;
   std::vector<std::thread> threads;
-  boost::barrier ready_barrier{(unsigned int)options.threads + 1};
-  results.resize(options.threads);
-  for (int i = 0; i < options.threads; i++) {
+  boost::barrier ready_barrier{(unsigned int)per_opts.threads + 1};
+  results.resize(per_opts.threads);
+  for (int i = 0; i < per_opts.threads; i++) {
     std::unique_ptr<ISender> sender;
-    if (test == "epoll") {
+    if (engine == "epoll") {
       sender = std::make_unique<EpollSender>(
-          options, port, ready_barrier, options.small_size);
-    } else if (test == "epoll_medium") {
-      sender = std::make_unique<EpollSender>(
-          options, port, ready_barrier, options.medium_size);
-    } else if (test == "epoll_large") {
-      sender = std::make_unique<EpollSender>(
-          options, port, ready_barrier, options.large_size);
+          options, per_opts, port, ready_barrier, per_opts.size);
     } else {
-      sender =
-          std::make_unique<Sender>(test, options, buffers, port, ready_barrier);
+      sender = std::make_unique<Sender>(
+          engine, options, per_opts, *buffers, port, ready_barrier);
     }
     threads.push_back(std::thread{wrapThread(
-        strcat("send", i), [i, s = std::move(sender), r = &results[i]]() {
+        strcat("send", i),
+        [i, buffers, s = std::move(sender), r = &results[i]]() {
           *r = s->go();
           vlog("test ", i, " done with ", r->toString());
         })});

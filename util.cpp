@@ -37,6 +37,11 @@ boost::program_options::variables_map simpleParse(
   }
   po::notify(vm);
   if (vm.count("help")) {
+    std::cerr << "parsing: ";
+    for(auto const& s : splits) {
+      std::cerr << s << " ";
+    }
+    std::cerr << "\n";
     std::cerr << desc << "\n";
     exit(1);
   }
