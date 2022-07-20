@@ -250,11 +250,16 @@ void runWorkload(RxConfig const& cfg, uint32_t consumed) {
 // response is a single byte when it is received
 struct ProtocolParser {
   // consume data and return number of new sends
-  uint32_t consume(char const* data, size_t n) {
-    uint32_t ret = 0;
+  struct ConsumeResults {
+    size_t to_write = 0;
+    uint32_t count = 0;
+  };
+
+  ConsumeResults consume(char const* data, size_t n) {
+    ConsumeResults ret;
     while (n > 0) {
       so_far += n;
-      if (!is_reading) {
+      if (!is_reading[0]) {
         if (likely(n >= sizeof(is_reading) && size_buff_have == 0)) {
           size_buff_have = sizeof(is_reading);
           memcpy(&is_reading, data, sizeof(is_reading));
@@ -269,11 +274,13 @@ struct ProtocolParser {
         }
       }
       // vlog("consume ", n, " is_reading=", is_reading);
-      if (is_reading && so_far >= is_reading + sizeof(is_reading)) {
+      if (is_reading[0] && so_far >= is_reading[0] + sizeof(is_reading)) {
         data += n;
-        n = so_far - (is_reading + sizeof(is_reading));
-        so_far = size_buff_have = is_reading = 0;
-        ret++;
+        n = so_far - (is_reading[0] + sizeof(is_reading));
+        ret.to_write += is_reading[1];
+        ret.count++;
+        so_far = size_buff_have = 0;
+        memset(&is_reading, 0, sizeof(is_reading));
       } else {
         break;
       }
@@ -282,7 +289,7 @@ struct ProtocolParser {
   }
 
   uint32_t size_buff_have = 0;
-  uint32_t is_reading = 0;
+  std::array<uint32_t, 2> is_reading;
   char size_buff[sizeof(is_reading)];
   uint32_t so_far = 0;
 };
@@ -856,7 +863,7 @@ struct BasicSock {
       sqe->flags |= IOSQE_FIXED_FILE;
     }
     sqe->flags |= IOSQE_CQE_SKIP_SUCCESS;
-    do_send -= std::min(len, do_send);
+    do_send -= std::min<size_t>(len, do_send);
   }
 
   void addRead(struct io_uring_sqe* sqe, TBufferProvider& provider) {
@@ -949,15 +956,15 @@ struct BasicSock {
 
  private:
   void didRead(char const* b, size_t n) {
-    uint32_t consumed = parser.consume(b, n);
-    runWorkload(cfg_, consumed);
-    do_send += consumed;
+    auto consumed = parser.consume(b, n);
+    runWorkload(cfg_, consumed.count);
+    do_send += consumed.to_write;
   }
 
   IoUringRxConfig const cfg_;
   int fd_;
   ProtocolParser parser;
-  uint32_t do_send = 0;
+  size_t do_send = 0;
   bool closed_ = false;
   struct msghdr recvmsgHdr_;
   struct iovec recvmsgHdrIoVec_;
@@ -1444,7 +1451,7 @@ static constexpr uint32_t kAccept6 = 2;
 struct EPollData {
   uint32_t type;
   int fd;
-  uint32_t to_write = 0;
+  size_t to_write = 0;
   bool write_in_epoll = false;
   ProtocolParser parser;
 };
@@ -1493,7 +1500,10 @@ struct EPollRunner : public RunnerBase {
     vlog("listening on ", fd, " v=", v6);
   }
 
-  void doSocket(EPollData* ed, uint32_t events, std::vector<EPollData*>& write_queue) {
+  void doSocket(
+      EPollData* ed,
+      uint32_t events,
+      std::vector<EPollData*>& write_queue) {
     if (events & EPOLLIN) {
       if (doRead(ed)) {
         return;
@@ -1577,10 +1587,10 @@ struct EPollRunner : public RunnerBase {
         return -1;
       } else {
         didRead(res);
-        uint32_t consumed = ed->parser.consume(rcvbuff.data(), res);
-        runWorkload(rxCfg_, consumed);
-        finishedRequests(consumed);
-        ed->to_write += consumed;
+        auto consumed = ed->parser.consume(rcvbuff.data(), res);
+        runWorkload(rxCfg_, consumed.count);
+        finishedRequests(consumed.count);
+        ed->to_write += consumed.to_write;
       }
     } while (res == (int)rcvbuff.size());
     return 0;
@@ -1643,7 +1653,7 @@ struct EPollRunner : public RunnerBase {
         }
       }
 
-      for(auto* ed : write_queue) {
+      for (auto* ed : write_queue) {
         if (!sockets_.count(ed) || !ed->to_write) {
           continue;
         }

@@ -67,7 +67,7 @@ std::string toString(SenderState s) {
   return strcat("<BAD State! ", (int)s, ">");
 }
 
-int constexpr kPreludeSize = 4;
+int constexpr kPreludeSize = 8;
 
 LatencyResult LatencyResult::from(
     std::vector<std::chrono::microseconds>&& durations) {
@@ -577,7 +577,7 @@ struct Connection {
   int connectRetries = 0;
 
   bool want_close = false;
-  uint32_t small_buff;
+  std::array<uint32_t, 2> small_buff;
 
   struct msghdr msg;
   struct iovec iovs[2];
@@ -796,6 +796,8 @@ class Sender : public ISender {
       uint32_t offset = connection->whole_write - to_send;
       uint32_t prelude_send = kPreludeSize - offset;
 
+      static_assert(sizeof(connection->small_buff) == kPreludeSize, "bad size");
+
       connection->iovs[0].iov_base =
           (void*)(((char const*)&connection->small_buff) + offset);
       connection->iovs[0].iov_len = prelude_send;
@@ -811,7 +813,8 @@ class Sender : public ISender {
   void queueNewSend(Connection* connection, uint32_t length) {
     connection->whole_write = connection->remaining = length + kPreludeSize;
     connection->write_at = buffers.buff().data();
-    memcpy(&connection->small_buff, &length, sizeof(connection->small_buff));
+    connection->small_buff[0] = length;
+    connection->small_buff[1] = 1;
     queueSend(connection);
   }
 
@@ -1165,9 +1168,11 @@ class EpollSender : public ISender {
     epollFd_ = checkedErrno(epoll_create(2048), "epoll_create");
 
     // prep buffer
-    buff.resize(sizeof(uint32_t) + size);
-    uint32_t len = size;
-    memcpy(buff.data(), &len, sizeof(len));
+    buff.resize(sizeof(uint32_t) * 2 + size);
+    std::array<uint32_t, 2> lens;
+    lens[0] = size;
+    lens[1] = 1;
+    memcpy(buff.data(), lens.data(), sizeof(lens));
   }
 
   ~EpollSender() {
