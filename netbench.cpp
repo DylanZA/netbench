@@ -164,7 +164,22 @@ struct IoUringRxConfig : RxConfig {
   }
 };
 
-struct EpollRxConfig : RxConfig {};
+struct EpollRxConfig : RxConfig {
+  bool batch_send = false;
+
+  std::string const toString() const override {
+    // only give the important options:
+    auto is_default = [this](auto EpollRxConfig::*x) {
+      EpollRxConfig base;
+      return this->*x == base.*x;
+    };
+    return strcat(
+        RxConfig::toString(),
+        is_default(&EpollRxConfig::batch_send)
+            ? ""
+            : strcat(" batch_send=", batch_send));
+  }
+};
 
 struct Config {
   std::vector<uint16_t> use_port;
@@ -1478,14 +1493,16 @@ struct EPollRunner : public RunnerBase {
     vlog("listening on ", fd, " v=", v6);
   }
 
-  void doSocket(EPollData* ed, uint32_t events) {
+  void doSocket(EPollData* ed, uint32_t events, std::vector<EPollData*>& write_queue) {
     if (events & EPOLLIN) {
       if (doRead(ed)) {
         return;
       }
     }
-    if (events & EPOLLOUT || ed->to_write) {
+    if ((events & EPOLLOUT) || (ed->to_write && !rxCfg_.batch_send)) {
       doWrite(ed);
+    } else if (ed->to_write) {
+      write_queue.push_back(ed);
     }
   }
 
@@ -1600,6 +1617,8 @@ struct EPollRunner : public RunnerBase {
 
   void loop(std::atomic<bool>* should_shutdown) override {
     RxStats rx_stats{name()};
+    std::vector<EPollData*> write_queue;
+    write_queue.reserve(1024);
     while (!should_shutdown->load() && !globalShouldShutdown.load()) {
       rx_stats.startWait();
       int nevents = checkedErrno(
@@ -1619,10 +1638,18 @@ struct EPollRunner : public RunnerBase {
             doAccept(ed->fd, true);
             break;
           default:
-            doSocket(ed, events[i].events);
+            doSocket(ed, events[i].events, write_queue);
             break;
         }
       }
+
+      for(auto* ed : write_queue) {
+        if (!sockets_.count(ed) || !ed->to_write) {
+          continue;
+        }
+        doWrite(ed);
+      }
+      write_queue.clear();
       if (cfg_.print_rx_stats) {
         rx_stats.doneLoop(bytesRx_, requestsRx_);
       }
@@ -1933,6 +1960,12 @@ io_uring_desc.add_options()
   ("provided_buffer_compact", po::value(&io_uring_cfg.provided_buffer_compact)
      ->default_value(io_uring_cfg.provided_buffer_compact))
   ;
+
+epoll_desc.add_options()
+  ("batch_send",  po::value(&epoll_cfg.batch_send)
+     ->default_value(epoll_cfg.batch_send))
+  ;
+
   // clang-format on
 
   po::options_description* used_desc = NULL;
