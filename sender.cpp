@@ -1142,6 +1142,7 @@ struct EpollConnection {
   int fd = -1;
   char* toSendAt = nullptr;
   ssize_t toSend = 0;
+  size_t toRecv = 0;
   TClock::time_point last;
   std::vector<std::chrono::microseconds> latencies;
 };
@@ -1149,6 +1150,7 @@ struct EpollConnection {
 class EpollSender : public ISender {
  public:
   std::vector<char> buff;
+  std::vector<char> rxbuff;
   EpollSender(
       GlobalSendOptions const& options,
       PerSendOptions const& per_opts,
@@ -1156,18 +1158,16 @@ class EpollSender : public ISender {
       boost::barrier& ready_barrier,
       uint32_t size)
       : cfg_(options), perCfg_(per_opts), ready_barrier(ready_barrier) {
-    if (per_opts.resp != 1) {
-      die("epoll tx only supports 1 size response");
-    }
     getAddress(options, port, &addr_, &addrLen_);
     latencies_.reserve(perCfg_.per_thread * 10000);
     epollFd_ = checkedErrno(epoll_create(2048), "epoll_create");
 
     // prep buffer
     buff.resize(sizeof(uint32_t) * 2 + size);
+    rxbuff.resize(std::min<size_t>(1024, per_opts.resp));
     std::array<uint32_t, 2> lens;
     lens[0] = size;
-    lens[1] = 1;
+    lens[1] = perCfg_.resp;
     memcpy(buff.data(), lens.data(), sizeof(lens));
   }
 
@@ -1257,6 +1257,7 @@ class EpollSender : public ISender {
     if (from_poll) {
       modEpoll(conn, i, EPOLLIN);
     }
+    conn->toRecv = perCfg_.resp;
     conn->sent(TClock::now());
     ++packetsSent_;
     bytesSent_ += buff.size();
@@ -1268,13 +1269,20 @@ class EpollSender : public ISender {
       log("cannot recv on ", i);
       return false;
     }
-    std::array<char, 100> buff;
     int e;
     do {
-      int ret = ::recv(conn->fd, buff.data(), buff.size(), 0);
+      int ret = ::recv(conn->fd, rxbuff.data(), rxbuff.size(), 0);
       if (ret > 0) {
-        latencies_.push_back(conn->recv(TClock::now()));
-        return true;
+        if ((size_t)ret > conn->toRecv) {
+          die("too much data, wanted only ", conn->toRecv, " got ", ret);
+        } else if ((size_t)ret == conn->toRecv) {
+          conn->toRecv = 0;
+          latencies_.push_back(conn->recv(TClock::now()));
+          return true;
+        } else {
+          conn->toRecv -= ret;
+          return false;
+        }
       } else if (ret == 0) {
         connections_[i].reset();
         log("connection ", i, " closed");

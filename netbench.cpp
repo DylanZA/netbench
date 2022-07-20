@@ -246,14 +246,21 @@ void runWorkload(RxConfig const& cfg, uint32_t consumed) {
   }
 }
 
+struct ConsumeResults {
+  size_t to_write = 0;
+  uint32_t count = 0;
+
+  ConsumeResults& operator+=(ConsumeResults const& rhs) {
+    to_write += rhs.to_write;
+    count += rhs.count;
+    return *this;
+  }
+};
+
 // benchmark protocol is <uint32_t length>:<payload of size length>
 // response is a single byte when it is received
 struct ProtocolParser {
   // consume data and return number of new sends
-  struct ConsumeResults {
-    size_t to_write = 0;
-    uint32_t count = 0;
-  };
 
   ConsumeResults consume(char const* data, size_t n) {
     ConsumeResults ret;
@@ -273,7 +280,6 @@ struct ProtocolParser {
           }
         }
       }
-      // vlog("consume ", n, " is_reading=", is_reading);
       if (is_reading[0] && so_far >= is_reading[0] + sizeof(is_reading)) {
         data += n;
         n = so_far - (is_reading[0] + sizeof(is_reading));
@@ -289,7 +295,7 @@ struct ProtocolParser {
   }
 
   uint32_t size_buff_have = 0;
-  std::array<uint32_t, 2> is_reading;
+  std::array<uint32_t, 2> is_reading = {{0}};
   char size_buff[sizeof(is_reading)];
   uint32_t so_far = 0;
 };
@@ -848,22 +854,21 @@ struct BasicSock {
     return fd_;
   }
 
-  uint32_t peekSend() {
+  ConsumeResults const& peekSend() {
     return do_send;
   }
 
-  void didSend(uint32_t count) {}
+  void didSend() {
+    do_send = {};
+  }
 
-  void addSend(struct io_uring_sqe* sqe, uint32_t len) {
-    if (len > ReadSize) {
-      die("too big send");
-    }
-    io_uring_prep_send(sqe, fd_, &buff[0], len, 0);
+  void addSend(struct io_uring_sqe* sqe, unsigned char* b, uint32_t len) {
+    uint32_t this_send = std::min<uint32_t>(ReadSize, len);
+    io_uring_prep_send(sqe, fd_, b, this_send, 0);
     if (isFixedFiles()) {
       sqe->flags |= IOSQE_FIXED_FILE;
     }
     sqe->flags |= IOSQE_CQE_SKIP_SUCCESS;
-    do_send -= std::min<size_t>(len, do_send);
   }
 
   void addRead(struct io_uring_sqe* sqe, TBufferProvider& provider) {
@@ -958,13 +963,13 @@ struct BasicSock {
   void didRead(char const* b, size_t n) {
     auto consumed = parser.consume(b, n);
     runWorkload(cfg_, consumed.count);
-    do_send += consumed.to_write;
+    do_send += consumed;
   }
 
   IoUringRxConfig const cfg_;
   int fd_;
   ProtocolParser parser;
-  size_t do_send = 0;
+  ConsumeResults do_send;
   bool closed_ = false;
   struct msghdr recvmsgHdr_;
   struct iovec recvmsgHdrIoVec_;
@@ -1007,6 +1012,7 @@ struct IOUringRunner : public RunnerBase {
         ring(mkIoUring(rx_cfg)),
         buffers_(rx_cfg) {
     cqes_.resize(rx_cfg.max_events);
+    sendBuff_.resize(2048);
 
     if (TSock::kUseBufferProviderVersion) {
       buffers_.initialRegister(&ring);
@@ -1108,8 +1114,11 @@ struct IOUringRunner : public RunnerBase {
   }
 
   void addSend(TSock* sock, uint32_t len) {
+    if (unlikely(sendBuff_.size() < len)) {
+      sendBuff_.resize(len);
+    }
     struct io_uring_sqe* sqe = get_sqe();
-    sock->addSend(sqe, len);
+    sock->addSend(sqe, sendBuff_.data(), len);
     io_uring_sqe_set_data(sqe, tag(sock, kWrite));
   }
 
@@ -1191,9 +1200,10 @@ struct IOUringRunner : public RunnerBase {
     }
 
     if (res.amount > 0) {
-      if (uint32_t sends = sock->peekSend(); sends > 0) {
-        finishedRequests(sends);
-        addSend(sock, sends);
+      if (auto const& sends = sock->peekSend(); sends.to_write > 0) {
+        finishedRequests(sends.count);
+        addSend(sock, sends.to_write);
+        sock->didSend();
       }
       didRead(res.amount);
       if (!sock->isMultiShotRecv() || !(cqe->flags & IORING_CQE_F_MORE)) {
@@ -1439,6 +1449,7 @@ struct IOUringRunner : public RunnerBase {
   typename TSock::TBufferProvider buffers_;
   std::vector<std::unique_ptr<ListenSock>> listenSocks_;
   std::vector<struct io_uring_cqe*> cqes_;
+  std::vector<unsigned char> sendBuff_;
   int listeners_ = 0;
   uint32_t enobuffCount_ = 0;
   std::vector<int> acceptFdPool_;
@@ -2103,7 +2114,6 @@ int main(int argc, char** argv) {
 
   std::vector<std::pair<std::string, SendResults>> results;
   if (cfg.tx.size()) {
-
     for (auto const& tx : cfg.tx) {
       for (auto const& r : receiver_factories) {
         Receiver rcv = r();
