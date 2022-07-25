@@ -220,14 +220,16 @@ class BenchmarkScenarioBase : public IBenchmarkScenario {
 
 class ConnectSendLots : public BenchmarkScenarioBase {
  public:
-  ConnectSendLots(uint64_t conns, uint64_t size)
-      : conns_(conns), sendSize_(size) {
+  ConnectSendLots(PerSendOptions const& per_options)
+      : conns_(per_options.per_thread),
+        sendSize_(per_options.size),
+        respSize_(per_options.resp) {
     for (uint64_t c = 1; c <= conns_; c++) {
       queue.emplace_back(Action(ActionOp::Connect, c));
     }
     queue.emplace_back(Action(ActionOp::Ready, 0));
-    lastSend_.resize(conns + 1);
-    sendTimes_.reserve(conns * 1000);
+    lastSend_.resize(conns_ + 1);
+    sendTimes_.reserve(conns_ * 1000);
   }
 
   void doneLast(uint64_t idx, ActionOp op) override {
@@ -236,7 +238,7 @@ class ConnectSendLots : public BenchmarkScenarioBase {
         startTiming_ = true;
         break;
       case ActionOp::Send:
-        queue.emplace_back(ActionOp::Recv, idx, 1);
+        queue.emplace_back(ActionOp::Recv, idx, respSize_);
         break;
       case ActionOp::Connect:
       case ActionOp::Recv:
@@ -269,14 +271,15 @@ class ConnectSendLots : public BenchmarkScenarioBase {
   bool startTiming_ = false;
   uint64_t conns_;
   uint64_t sendSize_;
+  uint64_t respSize_;
   std::vector<std::optional<TClock::time_point>> lastSend_;
   std::vector<TClock::duration> sendTimes_;
 };
 
 class ConnectSendDisconnect : public BenchmarkScenarioBase {
  public:
-  ConnectSendDisconnect(uint64_t concurrent, uint64_t send)
-      : concurrent_(concurrent), send_(send) {
+  ConnectSendDisconnect(PerSendOptions const& per_options)
+      : sendSize_(per_options.size), respSize_(per_options.resp) {
     for (uint64_t c = 1; c <= concurrent_; c++) {
       queue.emplace_back(Action(ActionOp::Connect, nextIdx_++));
     }
@@ -286,13 +289,13 @@ class ConnectSendDisconnect : public BenchmarkScenarioBase {
   void doneLast(uint64_t idx, ActionOp op) override {
     switch (op) {
       case ActionOp::Connect:
-        queue.emplace_back(ActionOp::Send, idx, send_);
+        queue.emplace_back(ActionOp::Send, idx, sendSize_);
         break;
       case ActionOp::Disconnect:
         queue.emplace_back(ActionOp::Connect, nextIdx_++);
         break;
       case ActionOp::Send:
-        queue.emplace_back(ActionOp::Recv, idx, 1);
+        queue.emplace_back(ActionOp::Recv, idx, respSize_);
         break;
       default:
         queue.emplace_back(ActionOp::Disconnect, idx);
@@ -307,7 +310,8 @@ class ConnectSendDisconnect : public BenchmarkScenarioBase {
  private:
   uint64_t nextIdx_ = 1;
   uint64_t concurrent_;
-  uint64_t send_;
+  uint64_t sendSize_;
+  uint64_t respSize_;
 };
 
 TClock::time_point getEpoch() {
@@ -330,12 +334,15 @@ TClock::time_point fromWaitParam(uint64_t val) {
 
 class BurstySend : public BenchmarkScenarioBase {
  public:
-  BurstySend(uint64_t conns, uint64_t size) : conns_(conns), sendSize_(size) {
+  BurstySend(PerSendOptions const& per_options)
+      : conns_(per_options.per_thread),
+        sendSize_(per_options.size),
+        respSize_(per_options.resp) {
     for (uint64_t c = 1; c <= conns_; c++) {
       queue.emplace_back(Action(ActionOp::Connect, c));
     }
     queue.emplace_back(Action(ActionOp::Ready, 0));
-    connections_.reserve(conns + 1);
+    connections_.reserve(conns_ + 1);
   }
 
   void newBurst() {
@@ -355,7 +362,7 @@ class BurstySend : public BenchmarkScenarioBase {
         newBurst();
         break;
       case ActionOp::Send:
-        queue.emplace_back(ActionOp::Recv, idx, 1);
+        queue.emplace_back(ActionOp::Recv, idx, respSize_);
         break;
       case ActionOp::Recv:
         stats_.add(idx);
@@ -386,6 +393,7 @@ class BurstySend : public BenchmarkScenarioBase {
  private:
   uint64_t conns_;
   uint64_t sendSize_;
+  uint64_t respSize_;
   uint64_t outstanding_ = 0;
   std::vector<uint64_t> connections_;
   std::vector<LatencyResult> burstResults_;
@@ -395,15 +403,17 @@ class BurstySend : public BenchmarkScenarioBase {
 class BurstySendPeriodic : public BenchmarkScenarioBase {
  public:
   BurstySendPeriodic(
-      uint64_t conns,
-      uint64_t size,
+      PerSendOptions const& per_options,
       std::chrono::microseconds period)
-      : conns_(conns), sendSize_(size), period_(period) {
+      : conns_(per_options.per_thread),
+        sendSize_(per_options.size),
+        respSize_(per_options.resp),
+        period_(period) {
     for (uint64_t c = 1; c <= conns_; c++) {
       queue.emplace_back(Action(ActionOp::Connect, c));
     }
     queue.emplace_back(Action(ActionOp::Ready, 0));
-    connections_.resize(conns + 1);
+    connections_.resize(conns_ + 1);
   }
 
   void parseMore(std::vector<std::string> const& split_args) override {
@@ -437,7 +447,7 @@ class BurstySendPeriodic : public BenchmarkScenarioBase {
         }
         break;
       case ActionOp::Send:
-        queue.emplace_back(ActionOp::Recv, idx, 1);
+        queue.emplace_back(ActionOp::Recv, idx, respSize_);
         break;
       case ActionOp::Recv:
       case ActionOp::WaitUntil:
@@ -495,6 +505,7 @@ class BurstySendPeriodic : public BenchmarkScenarioBase {
 
   uint64_t conns_;
   uint64_t sendSize_;
+  uint64_t respSize_;
   TClock::time_point burstStart_;
   TClock::time_point nextBurstStart_;
   std::chrono::microseconds period_;
@@ -523,24 +534,15 @@ std::unique_ptr<IBenchmarkScenario> makeScenario(
   }
   auto const& test = split[0];
   std::unique_ptr<IBenchmarkScenario> ret;
-  if (per_options.resp != 1) {
-    die("io_uring tx only supports 1 size response");
-  }
-
   if (test == "io_uring") {
-    ret = std::make_unique<ConnectSendLots>(
-        per_options.per_thread, per_options.size);
+    ret = std::make_unique<ConnectSendLots>(per_options);
   } else if (test == "io_uring_single") {
-    ret = std::make_unique<ConnectSendDisconnect>(
-        per_options.per_thread, per_options.size);
+    ret = std::make_unique<ConnectSendDisconnect>(per_options);
   } else if (test == "burst") {
-    ret =
-        std::make_unique<BurstySend>(per_options.per_thread, per_options.size);
+    ret = std::make_unique<BurstySend>(per_options);
   } else if (test == "burst_periodic") {
     ret = std::make_unique<BurstySendPeriodic>(
-        per_options.per_thread,
-        per_options.size,
-        std::chrono::microseconds(1000));
+        per_options, std::chrono::microseconds(1000));
   } else {
     die("unknown test ", test_args);
   }
@@ -805,7 +807,7 @@ class Sender : public ISender {
     connection->whole_write = connection->remaining = length + kPreludeSize;
     connection->write_at = buffers.buff().data();
     connection->small_buff[0] = length;
-    connection->small_buff[1] = 1;
+    connection->small_buff[1] = perCfg_.resp;
     queueSend(connection);
   }
 
