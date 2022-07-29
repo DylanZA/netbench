@@ -238,11 +238,13 @@ void runWorkload(RxConfig const& cfg, uint32_t consumed) {
   if (!cfg.workload)
     return;
   for (uint32_t i = 0; i < consumed; i++) {
+    nanosleep(nullptr, nullptr);
     for (size_t j = 0; j < cfg.workload * 1000; j++) {
       if (gInt.load()) {
         std::terminate();
       }
     }
+    nanosleep(nullptr, nullptr);
   }
 }
 
