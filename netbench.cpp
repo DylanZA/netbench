@@ -26,7 +26,6 @@
 namespace po = boost::program_options;
 
 namespace {
-
 #ifndef __NR_io_uring_enter
 static constexpr int __NR_io_uring_enter = 426;
 #endif
@@ -152,6 +151,9 @@ struct IoUringRxConfig : RxConfig {
         is_default(&IoUringRxConfig::huge_pages)
             ? ""
             : strcat(" huge_pages=", huge_pages),
+        is_default(&IoUringRxConfig::defer_taskrun)
+            ? ""
+            : strcat(" defer_taskrun=", defer_taskrun),
         is_default(&IoUringRxConfig::multishot_recv)
             ? ""
             : strcat(" multishot_recv=", multishot_recv));
@@ -211,7 +213,15 @@ std::pair<struct io_uring, IoUringRxConfig> mkIoUring(
 
   unsigned int newer_flags =
       IORING_SETUP_SUBMIT_ALL | IORING_SETUP_COOP_TASKRUN;
+
+  params.flags = newer_flags;
   params.flags |= IORING_SETUP_CQSIZE;
+
+  if (rx_cfg.defer_taskrun) {
+    params.flags |= IORING_SETUP_DEFER_TASKRUN;
+    params.flags |= IORING_SETUP_SINGLE_ISSUER;
+  }
+
   params.cq_entries = cqe_count;
   int ret = io_uring_queue_init_params(rx_cfg.sqe_count, &ring, &params);
   if (ret < 0) {
@@ -1967,6 +1977,8 @@ io_uring_desc.add_options()
      ->default_value(io_uring_cfg.provided_buffer_low_watermark))
   ("provided_buffer_compact", po::value(&io_uring_cfg.provided_buffer_compact)
      ->default_value(io_uring_cfg.provided_buffer_compact))
+  ("defer_taskrun", po::value(&io_uring_cfg.defer_taskrun)
+     ->default_value(io_uring_cfg.defer_taskrun))
   ;
 
 epoll_desc.add_options()
