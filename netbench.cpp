@@ -1867,7 +1867,7 @@ desc.add_options()
       }
     }
   } else {
-    config.tx.push_back("small");
+    config.tx.push_back("epoll");
   }
 
   if (vm.count("rx")) {
