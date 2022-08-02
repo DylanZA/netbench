@@ -2,6 +2,8 @@
 
 #include <fcntl.h>
 #include <stdio.h>
+#include <sys/syscall.h>
+#include <sys/types.h>
 
 namespace po = boost::program_options;
 
@@ -38,7 +40,7 @@ boost::program_options::variables_map simpleParse(
   po::notify(vm);
   if (vm.count("help")) {
     std::cerr << "parsing: ";
-    for(auto const& s : splits) {
+    for (auto const& s : splits) {
       std::cerr << s << " ";
     }
     std::cerr << "\n";
@@ -95,4 +97,26 @@ std::string hexdump(void const* p, size_t n) {
     ss << (int)p2[i];
   }
   return ss.str();
+}
+
+std::atomic<int> gInt{0};
+void runWorkload(unsigned int outer, unsigned int inner) {
+  for (uint32_t i = 0; i < outer; i++) {
+    size_t loops = 0;
+    auto start = std::chrono::steady_clock::now();
+    auto end = start + std::chrono::microseconds(inner);
+    syscall(99999999);
+    do {
+      loops++;
+      __builtin_ia32_pause();
+    } while (std::chrono::steady_clock::now() < end);
+    syscall(99999999);
+    vlog(
+        "took ",
+        std::chrono::duration_cast<std::chrono::microseconds>(
+            std::chrono::steady_clock::now() - start)
+            .count(),
+        "us loops=",
+        loops);
+  }
 }

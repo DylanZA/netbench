@@ -880,6 +880,9 @@ class Sender : public ISender {
         } else {
           // finished
           connection->remaining = 0;
+          if (perCfg_.workload) {
+            runWorkload(1, perCfg_.workload);
+          }
         }
         break;
       case ActionOp::WaitUntil:
@@ -1318,6 +1321,9 @@ class EpollSender : public ISender {
       for (int i = 0; i < nevents; i++) {
         if (epoll_events[i].events & EPOLLIN) {
           if (doRead(i)) {
+            if (perCfg_.workload) {
+              runWorkload(1, perCfg_.workload);
+            }
             doSend(i, false);
           }
         } else if (epoll_events[i].events & EPOLLOUT) {
@@ -1378,6 +1384,7 @@ std::pair<std::string, PerSendOptions> PerSendOptions::parseOptions(
 ("per_thread", po::value(&cfg.per_thread)->default_value(cfg.per_thread))
 ("size", po::value(&cfg.size)->default_value(cfg.size))
 ("resp", po::value(&cfg.resp)->default_value(cfg.resp))
+("workload", po::value(&cfg.workload)->default_value(cfg.workload))
   ;
   // clang-format on
 
