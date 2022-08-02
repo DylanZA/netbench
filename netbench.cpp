@@ -1571,8 +1571,8 @@ struct EPollRunner : public RunnerBase {
             errnum);
         delSock();
         close(fd);
-        delete ed;
         sockets_.erase(ed);
+        delete ed;
 
         return -1;
       } else {
