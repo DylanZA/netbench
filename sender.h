@@ -20,7 +20,8 @@ struct PerSendOptions {
   int threads = 4;
   int per_thread = 64;
   size_t size = 64;
-  size_t resp = 1;
+  size_t resp = 64;
+  size_t workload = 0;
   static std::pair<std::string, PerSendOptions> parseOptions(std::string const& tx);
 };
 

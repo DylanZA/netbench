@@ -123,7 +123,8 @@ struct IoUringRxConfig : RxConfig {
   int provided_buffer_low_watermark = -1;
   int provided_buffer_compact = 1;
   bool huge_pages = false;
-  int multishot_recv = 0;
+  int multishot_recv = 1;
+  bool defer_taskrun = false;
 
   std::string const toString() const override {
     // only give the important options:
