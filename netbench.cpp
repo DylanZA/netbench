@@ -33,16 +33,6 @@ static constexpr int __NR_io_uring_enter = 426;
 #ifndef __NR_io_uring_register
 static constexpr int __NR_io_uring_register = 427;
 #endif
-static inline int ____sys_io_uring_register(
-    int fd,
-    unsigned opcode,
-    const void* arg,
-    unsigned nr_args) {
-  int ret;
-
-  ret = syscall(__NR_io_uring_register, fd, opcode, arg, nr_args);
-  return (ret < 0) ? -errno : ret;
-}
 
 static inline int ____sys_io_uring_enter2(
     int fd,
