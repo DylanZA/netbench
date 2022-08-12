@@ -1,5 +1,6 @@
 #include "util.h"
 
+#include <atomic>
 #include <fcntl.h>
 #include <stdio.h>
 #include <sys/syscall.h>
