@@ -109,7 +109,11 @@ void runWorkload(unsigned int outer, unsigned int inner) {
     syscall(99999999);
     do {
       loops++;
+#ifdef __i386__
       __builtin_ia32_pause();
+#elif __arm__
+      asm volatile("yield");.
+#endif
     } while (std::chrono::steady_clock::now() < end);
     syscall(99999999);
     vlog(

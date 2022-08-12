@@ -33,6 +33,7 @@ $(OBJECTS): submodule_liburing
 endif
 
 $(OBJECTS): Makefile
+objects: $(OBJECTS)
 
 $(TARGET): $(OBJECTS)
 	$(CXX) $(OBJECTS) $(CXXFLAGS) $(LDFLAGS) -o $@
@@ -43,7 +44,7 @@ clean:
 
 all: default
 
-.depend: $(SRCS) $(HEADERS)
+.depend: $(SRCS)
 	rm -f ./.depend
 	$(CXX) $(CXXFLAGS) -MM $^ >> ./.depend
 depend: .depend

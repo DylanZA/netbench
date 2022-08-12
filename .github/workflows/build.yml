@@ -27,6 +27,13 @@ jobs:
             cc: clang
             cxx: clang++
 
+          # aarch64 gcc
+          - arch: aarch64
+            cc_pkg: gcc-aarch64-linux-gnu
+            cxx_pkg: g++-aarch64-linux-gnu
+            cc: aarch64-linux-gnu-gcc
+            cxx: aarch64-linux-gnu-g++
+
     env:
       FLAGS: -g -O3 -Wall -Wextra -Werror
 
@@ -66,8 +73,16 @@ jobs:
         ./configure --cc=${{matrix.cc}} --cxx=${{matrix.cxx}};
         make -j$(nproc) V=1 CPPFLAGS="-Werror" CFLAGS="$FLAGS" CXXFLAGS="$FLAGS";
 
-    - name: Build
-      run: make -j$(nproc) V=1 SUBMODULE_LIBURING=1 CXXFLAGS_EXTRA="-Werror";
+    - name: Build and tests
+      run: |
+        if [[ "${{matrix.arch}}" == "x86_64" ]]; then \
+          make -j$(nproc) V=1 SUBMODULE_LIBURING=1 CXX=${{matrix.cxx}} CC=${{matrix.cc}} CXXFLAGS_EXTRA="-Werror" check; \
+        else \
+          make -j$(nproc) V=1 SUBMODULE_LIBURING=1 CXX=${{matrix.cxx}} CC=${{matrix.cc}} CXXFLAGS_EXTRA="-Werror" objects; \
+        fi;
 
-    - name: Test
-      run: make -j$(nproc) V=1 SUBMODULE_LIBURING=1 CXXFLAGS_EXTRA="-Werror" check;
+    - name: Done
+      run: echo DONE
+
+
+       
