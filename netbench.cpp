@@ -855,8 +855,7 @@ struct BasicSock {
   }
 
   void addSend(struct io_uring_sqe* sqe, unsigned char* b, uint32_t len) {
-    uint32_t this_send = std::min<uint32_t>(ReadSize, len);
-    io_uring_prep_send(sqe, fd_, b, this_send, 0);
+    io_uring_prep_send(sqe, fd_, b, len, MSG_WAITALL);
     if (isFixedFiles()) {
       sqe->flags |= IOSQE_FIXED_FILE;
     }
