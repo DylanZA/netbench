@@ -556,6 +556,7 @@ struct Connection {
     msg.msg_name = NULL;
     msg.msg_namelen = 0;
     msg.msg_iov = &iovs[0];
+    recv_buff.resize(64);
   }
 
   uint64_t id;
@@ -569,7 +570,7 @@ struct Connection {
   int connectRetries = 0;
 
   bool want_close = false;
-  std::array<uint32_t, 2> small_buff;
+  std::vector<char> recv_buff;
 
   struct msghdr msg;
   struct iovec iovs[2];
@@ -789,10 +790,8 @@ class Sender : public ISender {
       uint32_t offset = connection->whole_write - to_send;
       uint32_t prelude_send = kPreludeSize - offset;
 
-      static_assert(sizeof(connection->small_buff) == kPreludeSize, "bad size");
-
       connection->iovs[0].iov_base =
-          (void*)(((char const*)&connection->small_buff) + offset);
+          (void*)(((char const*)connection->recv_buff.data()) + offset);
       connection->iovs[0].iov_len = prelude_send;
       to_send -= kPreludeSize;
     }
@@ -806,19 +805,19 @@ class Sender : public ISender {
   void queueNewSend(Connection* connection, uint32_t length) {
     connection->whole_write = connection->remaining = length + kPreludeSize;
     connection->write_at = buffers.buff().data();
-    connection->small_buff[0] = length;
-    connection->small_buff[1] = perCfg_.resp;
+    connection->recv_buff[0] = length;
+    connection->recv_buff[1] = perCfg_.resp;
     queueSend(connection);
   }
 
   void queueRecv(Connection* connection, uint32_t length) {
-    if (length > sizeof(connection->small_buff)) {
-      die(length, " too big");
+    if (length > connection->recv_buff.size()) {
+      connection->recv_buff.resize(length);
     }
     connection->remaining = length;
     auto* sqe = get_sqe();
     io_uring_prep_recv(
-        sqe, connection->fd, (void*)&connection->small_buff, length, 0);
+        sqe, connection->fd, connection->recv_buff.data(), length, 0);
     io_uring_sqe_set_data(sqe, (void*)connection->id);
   }
 

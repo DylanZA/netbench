@@ -7,6 +7,7 @@ OBJECTS = $(patsubst %.cpp, %.o, $(SRCS))
 TARGET = netbench
 SANITIZED_TARGET = $(TARGET).asan
 STATIC_LIBS = 0
+SUBMODULE_LIBURING = 0
 
 ifeq ($(STATIC_LIBS), 1)
 LDFLAGS += -l:libboost_thread.a  -l:libboost_system.a -l:libboost_program_options.a -l:liburing.a
@@ -15,6 +16,18 @@ LDFLAGS += -lboost_thread  -lboost_system -lboost_program_options -luring
 endif
 
 default: $(TARGET)
+.PHONY: all submodule_liburing
+
+submodule_liburing:
+
+ifeq ($(SUBMODULE_LIBURING), 1)
+LDFLAGS += -L liburing/src
+CXXFLAGS += -I liburing/src/include
+
+submodule_liburing:
+	@$(MAKE) -C liburing
+$(OBJECTS): submodule_liburing
+endif
 
 $(OBJECTS): Makefile
 
