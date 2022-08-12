@@ -116,6 +116,9 @@ struct IoUringRxConfig : RxConfig {
   int multishot_recv = 1;
   bool defer_taskrun = false;
 
+  // not for actual user updating, but dependent on the kernel:
+  unsigned int cqe_skip_success_flag = 0;
+
   std::string const toString() const override {
     // only give the important options:
     auto is_default = [this](auto IoUringRxConfig::*x) {
@@ -195,7 +198,8 @@ int mkServerSock(
   return fd;
 }
 
-struct io_uring mkIoUring(IoUringRxConfig const& rx_cfg) {
+std::pair<struct io_uring, IoUringRxConfig> mkIoUring(
+    IoUringRxConfig const& rx_cfg) {
   struct io_uring_params params;
   struct io_uring ring;
   memset(&params, 0, sizeof(params));
@@ -221,7 +225,11 @@ struct io_uring mkIoUring(IoUringRxConfig const& rx_cfg) {
   if (rx_cfg.register_ring) {
     checkedErrno(io_uring_register_ring_fd(&ring), "register ring fd");
   }
-  return ring;
+  auto ret_cfg = rx_cfg;
+  if (params.features & IORING_FEAT_CQE_SKIP) {
+    ret_cfg.cqe_skip_success_flag = IOSQE_CQE_SKIP_SUCCESS;
+  }
+  return std::make_pair(ring, std::move(ret_cfg));
 }
 
 void runWorkload(RxConfig const& cfg, uint32_t consumed) {
@@ -852,7 +860,7 @@ struct BasicSock {
     if (isFixedFiles()) {
       sqe->flags |= IOSQE_FIXED_FILE;
     }
-    sqe->flags |= IOSQE_CQE_SKIP_SUCCESS;
+    sqe->flags |= cfg_.cqe_skip_success_flag;
   }
 
   void addRead(struct io_uring_sqe* sqe, TBufferProvider& provider) {
@@ -989,11 +997,12 @@ struct IOUringRunner : public RunnerBase {
   explicit IOUringRunner(
       Config const& cfg,
       IoUringRxConfig const& rx_cfg,
+      struct io_uring r,
       std::string const& name)
       : RunnerBase(name),
         cfg_(cfg),
         rxCfg_(rx_cfg),
-        ring(mkIoUring(rx_cfg)),
+        ring(r),
         buffers_(rx_cfg) {
     cqes_.resize(rx_cfg.max_events);
     sendBuff_.resize(2048);
@@ -1755,9 +1764,10 @@ void mbIoUringRxFactory(
     if (runner) {
       die("already had a runner? flags=", flags, " this=", MbFlag);
     }
+    auto [ring, new_cfg] = mkIoUring(rx_cfg);
     runner =
         std::make_unique<IOUringRunner<typename BasicSockPicker<MbFlag>::Sock>>(
-            cfg, rx_cfg, name);
+            cfg, new_cfg, ring, name);
   }
 }
 
