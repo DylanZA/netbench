@@ -1054,7 +1054,6 @@ struct IOUringRunner : public RunnerBase {
       struct io_uring r,
       std::string const& name)
       : RunnerBase(name), cfg_(cfg), rxCfg_(rx_cfg), ring(r), buffers_(rx_cfg) {
-    cqes_.resize(rx_cfg.max_events);
     sendBuff_.resize(2048);
 
     if (TSock::kUseBufferProviderVersion) {
@@ -1383,6 +1382,7 @@ struct IOUringRunner : public RunnerBase {
     while (socks() || !stopping) {
       bool const was_overflow = isOverflow();
       unsigned int reads = 0;
+      struct io_uring_cqe* cqe = nullptr;
       provideBuffers(false);
 
       rx_stats.startWait();
@@ -1391,21 +1391,20 @@ struct IOUringRunner : public RunnerBase {
         flushOverflow();
         rx_stats.doneWait();
       } else if (expected) {
-        cqes_[0] = nullptr;
-        submitAndWait1(&cqes_[0], &timeout);
+        submitAndWait1(&cqe, &timeout);
         rx_stats.doneWait();
         // cqe might not be set here if we submitted
       } else {
         int wait_res = checkedErrno(
-            io_uring_wait_cqe_timeout(&ring, &cqes_[0], &timeout),
+            io_uring_wait_cqe_timeout(&ring, &cqe, &timeout),
             "wait_cqe_timeout");
 
         rx_stats.doneWait();
 
         // can trust here that cqe will be set
-        if (!wait_res && cqes_[0]) {
-          processCqe(cqes_[0], reads);
-          io_uring_cqe_seen(&ring, cqes_[0]);
+        if (!wait_res && cqe) {
+          processCqe(cqe, reads);
+          io_uring_cqe_seen(&ring, cqe);
         }
       }
 
@@ -1421,23 +1420,20 @@ struct IOUringRunner : public RunnerBase {
         timeout.tv_nsec = 100000000;
       }
 
-      int cqe_count;
-      int loop_count = 0;
-      do {
-        cqe_count = io_uring_peek_batch_cqe(&ring, cqes_.data(), cqes_.size());
-        for (int i = 0; i < cqe_count; i++) {
-          processCqe(cqes_[i], reads);
-        }
-        io_uring_cq_advance(&ring, cqe_count);
-        loop_count += cqe_count;
-      } while (cqe_count > 0 && loop_count < rxCfg_.max_cqe_loop);
+      int cqe_count = 0;
+      unsigned int head;
+      io_uring_for_each_cqe(&ring, head, cqe) {
+        processCqe(cqe, reads);
+        cqe_count++;
+      }
+      io_uring_cq_advance(&ring, cqe_count);
 
       if (!cqe_count && stopping) {
         vlog("processed ", cqe_count, " socks()=", socks());
       }
 
       if (cfg_.print_rx_stats) {
-        rx_stats.doneLoop(bytesRx_, requestsRx_, was_overflow, reads);
+        rx_stats.doneLoop(bytesRx_, requestsRx_, reads, was_overflow);
       }
     }
   }
@@ -1493,7 +1489,6 @@ struct IOUringRunner : public RunnerBase {
 
   typename TSock::TBufferProvider buffers_;
   std::vector<std::unique_ptr<ListenSock>> listenSocks_;
-  std::vector<struct io_uring_cqe*> cqes_;
   std::vector<unsigned char> sendBuff_;
   int listeners_ = 0;
   uint32_t enobuffCount_ = 0;
