@@ -185,6 +185,7 @@ struct Config {
   GlobalSendOptions send_options;
 
   bool print_rx_stats = true;
+  bool print_read_stats = true;
   std::vector<std::string> tx;
   std::vector<std::string> rx;
 };
@@ -304,10 +305,14 @@ struct ProtocolParser {
 
 class RxStats {
  public:
-  RxStats(std::string const& name) : name_(name) {
+  RxStats(std::string const& name, bool countReads)
+      : name_(name), countReads_(countReads) {
     auto const now = std::chrono::steady_clock::now();
     started_ = lastStats_ = now;
     lastClock_ = checkedErrno(times(&lastTimes_), "initial times");
+    if (countReads_) {
+      reads_.reserve(32000);
+    }
   }
 
   void startWait() {
@@ -323,13 +328,21 @@ class RxStats {
     }
   }
 
-  void doneLoop(size_t bytes, size_t requests, bool is_overflow = false) {
+  void doneLoop(
+      size_t bytes,
+      size_t requests,
+      unsigned int reads,
+      bool is_overflow = false) {
     auto const now = std::chrono::steady_clock::now();
     auto const duration = now - lastStats_;
     ++loops_;
 
     if (is_overflow) {
       ++overflows_;
+    }
+
+    if (countReads_) {
+      reads_.push_back(reads);
     }
 
     if (duration >= std::chrono::seconds(1)) {
@@ -341,6 +354,28 @@ class RxStats {
   std::chrono::milliseconds getMs(clock_t from, clock_t to) {
     return std::chrono::milliseconds(
         to <= from ? 0llu : (((to - from) * 1000llu) / ticksPerSecond_));
+  }
+
+  template <size_t N>
+  int getReadStats(std::array<char, N>& arr) {
+    if (!reads_.size()) {
+      return 0;
+    }
+
+    std::sort(reads_.begin(), reads_.end());
+    size_t tot = std::accumulate(reads_.begin(), reads_.end(), size_t(0));
+    double avg = tot / (double)reads_.size();
+    unsigned int p10 = reads_[reads_.size() / 10];
+    unsigned int p50 = reads_[reads_.size() / 2];
+    unsigned int p90 = reads_[(int)(reads_.size() * 0.9)];
+    return snprintf(
+        arr.data(),
+        arr.size(),
+        " read_per_loop: p10=%u p50=%u p90=%u avg=%.2f",
+        p10,
+        p50,
+        p90,
+        avg);
   }
 
   void doLog(
@@ -373,7 +408,15 @@ class RxStats {
           loops_,
           overflows_);
       if (written >= 0) {
-        log(std::string_view(buff, written));
+        std::array<char, 2048> read_stats_buf;
+        std::string_view read_stats;
+        if (countReads_) {
+          read_stats = std::string_view(
+              read_stats_buf.data(), getReadStats(read_stats_buf));
+          reads_.clear();
+        }
+
+        log(std::string_view(buff, written), read_stats);
       }
     }
     loops_ = overflows_ = 0;
@@ -388,6 +431,8 @@ class RxStats {
 
  private:
   std::string const& name_;
+  bool const countReads_;
+  std::vector<unsigned int> reads_;
   std::chrono::steady_clock::time_point started_ =
       std::chrono::steady_clock::now();
   std::chrono::steady_clock::time_point lastStats_ =
@@ -1008,11 +1053,7 @@ struct IOUringRunner : public RunnerBase {
       IoUringRxConfig const& rx_cfg,
       struct io_uring r,
       std::string const& name)
-      : RunnerBase(name),
-        cfg_(cfg),
-        rxCfg_(rx_cfg),
-        ring(r),
-        buffers_(rx_cfg) {
+      : RunnerBase(name), cfg_(cfg), rxCfg_(rx_cfg), ring(r), buffers_(rx_cfg) {
     cqes_.resize(rx_cfg.max_events);
     sendBuff_.resize(2048);
 
@@ -1245,12 +1286,13 @@ struct IOUringRunner : public RunnerBase {
     }
   }
 
-  void processCqe(struct io_uring_cqe* cqe) {
+  void processCqe(struct io_uring_cqe* cqe, unsigned int& reads) {
     switch (get_tag(cqe->user_data)) {
       case kAccept:
         processAccept(cqe);
         break;
       case kRead:
+        ++reads;
         processRead(cqe);
         break;
       case kWrite:
@@ -1329,7 +1371,7 @@ struct IOUringRunner : public RunnerBase {
   }
 
   void loop(std::atomic<bool>* should_shutdown) override {
-    RxStats rx_stats{name()};
+    RxStats rx_stats{name(), cfg_.print_read_stats};
     struct __kernel_timespec timeout;
     timeout.tv_sec = 1;
     timeout.tv_nsec = 0;
@@ -1340,6 +1382,7 @@ struct IOUringRunner : public RunnerBase {
 
     while (socks() || !stopping) {
       bool const was_overflow = isOverflow();
+      unsigned int reads = 0;
       provideBuffers(false);
 
       rx_stats.startWait();
@@ -1356,12 +1399,12 @@ struct IOUringRunner : public RunnerBase {
         int wait_res = checkedErrno(
             io_uring_wait_cqe_timeout(&ring, &cqes_[0], &timeout),
             "wait_cqe_timeout");
+
         rx_stats.doneWait();
 
         // can trust here that cqe will be set
         if (!wait_res && cqes_[0]) {
-          rx_stats.doneWait();
-          processCqe(cqes_[0]);
+          processCqe(cqes_[0], reads);
           io_uring_cqe_seen(&ring, cqes_[0]);
         }
       }
@@ -1383,7 +1426,7 @@ struct IOUringRunner : public RunnerBase {
       do {
         cqe_count = io_uring_peek_batch_cqe(&ring, cqes_.data(), cqes_.size());
         for (int i = 0; i < cqe_count; i++) {
-          processCqe(cqes_[i]);
+          processCqe(cqes_[i], reads);
         }
         io_uring_cq_advance(&ring, cqe_count);
         loop_count += cqe_count;
@@ -1394,7 +1437,7 @@ struct IOUringRunner : public RunnerBase {
       }
 
       if (cfg_.print_rx_stats) {
-        rx_stats.doneLoop(bytesRx_, requestsRx_, was_overflow);
+        rx_stats.doneLoop(bytesRx_, requestsRx_, was_overflow, reads);
       }
     }
   }
@@ -1516,8 +1559,10 @@ struct EPollRunner : public RunnerBase {
   void doSocket(
       EPollData* ed,
       uint32_t events,
-      std::vector<EPollData*>& write_queue) {
+      std::vector<EPollData*>& write_queue,
+      unsigned int& reads) {
     if (events & EPOLLIN) {
+      reads++;
       if (doRead(ed)) {
         return;
       }
@@ -1639,7 +1684,7 @@ struct EPollRunner : public RunnerBase {
   void stop() override {}
 
   void loop(std::atomic<bool>* should_shutdown) override {
-    RxStats rx_stats{name()};
+    RxStats rx_stats{name(), cfg_.print_read_stats};
     std::vector<EPollData*> write_queue;
     write_queue.reserve(1024);
     while (!should_shutdown->load() && !globalShouldShutdown.load()) {
@@ -1651,6 +1696,7 @@ struct EPollRunner : public RunnerBase {
       if (!nevents) {
         vlog("epoll: no events socks()=", socks());
       }
+      unsigned int reads = 0;
       for (int i = 0; i < nevents; ++i) {
         EPollData* ed = (EPollData*)events[i].data.ptr;
         switch (ed->type) {
@@ -1661,7 +1707,7 @@ struct EPollRunner : public RunnerBase {
             doAccept(ed->fd, true);
             break;
           default:
-            doSocket(ed, events[i].events, write_queue);
+            doSocket(ed, events[i].events, write_queue, reads);
             break;
         }
       }
@@ -1674,7 +1720,7 @@ struct EPollRunner : public RunnerBase {
       }
       write_queue.clear();
       if (cfg_.print_rx_stats) {
-        rx_stats.doneLoop(bytesRx_, requestsRx_);
+        rx_stats.doneLoop(bytesRx_, requestsRx_, reads);
       }
     }
 
@@ -1820,7 +1866,10 @@ Config parse(int argc, char** argv) {
 desc.add_options()
 ("help", "produce help message")
 ("verbose", "verbose logging")
-("print_rx_stats", po::value(&config.print_rx_stats))
+("print_rx_stats", po::value(&config.print_rx_stats)
+         ->default_value(config.print_rx_stats))
+("print_read_stats", po::value(&config.print_read_stats)
+        ->default_value(config.print_read_stats))
 ("use_port", po::value<std::vector<uint16_t>>(&config.use_port)->multitoken(),
  "what target port")
 ("control_port", po::value(&config.control_port))
