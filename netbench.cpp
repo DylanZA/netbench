@@ -221,6 +221,7 @@ std::pair<struct io_uring, IoUringRxConfig> mkIoUring(
   if (rx_cfg.defer_taskrun) {
     params.flags |= IORING_SETUP_DEFER_TASKRUN;
     params.flags |= IORING_SETUP_SINGLE_ISSUER;
+    params.flags |= IORING_SETUP_R_DISABLED;
   }
 
   params.cq_entries = cqe_count;
@@ -459,6 +460,7 @@ class RunnerBase {
   std::string const& name() const {
     return name_;
   }
+  virtual void start() {}
   virtual void loop(std::atomic<bool>* should_shutdown) = 0;
   virtual void stop() = 0;
   virtual void addListenSock(int fd, bool v6) = 0;
@@ -1369,6 +1371,10 @@ struct IOUringRunner : public RunnerBase {
         ring.enter_ring_fd, 0, 0, flags, NULL, _NSIG / 8);
   }
 
+  void start() override {
+    io_uring_enable_rings(&ring);
+  }
+
   void loop(std::atomic<bool>* should_shutdown) override {
     RxStats rx_stats{name(), cfg_.print_read_stats};
     struct __kernel_timespec timeout;
@@ -1763,6 +1769,7 @@ uint16_t pickPort(Config const& config) {
 
 void run(std::unique_ptr<RunnerBase> runner, std::atomic<bool>* shutdown) {
   try {
+    runner->start();
     runner->loop(shutdown);
   } catch (InterruptedException const&) {
     vlog("interrupted, cleaning up nicely");
