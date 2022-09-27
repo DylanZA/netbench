@@ -1303,7 +1303,15 @@ struct IOUringRunner : public RunnerBase {
         if (cqe->res < 0) {
           // we should track these down and make sure they only happen when the
           // sender socket is closed
-          log("bad socket write ", cqe->res);
+          TSock* sock = untag<TSock>(cqe->user_data);
+          if (!sock->closing()) {
+            log("bad socket write ",
+                cqe->res,
+                " closing=",
+                sock->closing(),
+                " fd=",
+                sock->fd());
+          }
         }
         break;
       case kOther:

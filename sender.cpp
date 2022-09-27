@@ -1219,6 +1219,7 @@ class EpollSender : public ISender {
 
   void doConnect() {
     for (int i = 0; i < perCfg_.per_thread; i++) {
+      std::this_thread::sleep_for(std::chrono::microseconds(100 * perCfg_.threads));
       if (addConnection()) {
         successConnects_++;
       } else {
