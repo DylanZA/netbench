@@ -278,8 +278,13 @@ class ConnectSendLots : public BenchmarkScenarioBase {
 
 class ConnectSendDisconnect : public BenchmarkScenarioBase {
  public:
-  ConnectSendDisconnect(PerSendOptions const& per_options)
-      : sendSize_(per_options.size), respSize_(per_options.resp) {
+  ConnectSendDisconnect(
+      PerSendOptions const& per_options,
+      size_t reconnect_from = 0)
+      : concurrent_(per_options.per_thread),
+        sendSize_(per_options.size),
+        respSize_(per_options.resp),
+        reconnectFrom_(reconnect_from) {
     for (uint64_t c = 1; c <= concurrent_; c++) {
       queue.emplace_back(Action(ActionOp::Connect, nextIdx_++));
     }
@@ -298,7 +303,9 @@ class ConnectSendDisconnect : public BenchmarkScenarioBase {
         queue.emplace_back(ActionOp::Recv, idx, respSize_);
         break;
       default:
-        queue.emplace_back(ActionOp::Disconnect, idx);
+        if (idx >= reconnectFrom_) {
+          queue.emplace_back(ActionOp::Disconnect, idx);
+        }
         break;
     }
   }
@@ -312,6 +319,7 @@ class ConnectSendDisconnect : public BenchmarkScenarioBase {
   uint64_t concurrent_;
   uint64_t sendSize_;
   uint64_t respSize_;
+  size_t reconnectFrom_;
 };
 
 TClock::time_point getEpoch() {
@@ -538,6 +546,8 @@ std::unique_ptr<IBenchmarkScenario> makeScenario(
     ret = std::make_unique<ConnectSendLots>(per_options);
   } else if (test == "io_uring_single") {
     ret = std::make_unique<ConnectSendDisconnect>(per_options);
+  } else if (test == "io_uring_single_some_idle") {
+    ret = std::make_unique<ConnectSendDisconnect>(per_options, 4);
   } else if (test == "burst") {
     ret = std::make_unique<BurstySend>(per_options);
   } else if (test == "burst_periodic") {
@@ -805,8 +815,9 @@ class Sender : public ISender {
   void queueNewSend(Connection* connection, uint32_t length) {
     connection->whole_write = connection->remaining = length + kPreludeSize;
     connection->write_at = buffers.buff().data();
-    connection->recv_buff[0] = length;
-    connection->recv_buff[1] = perCfg_.resp;
+    uint32_t* as_int = (uint32_t*)connection->recv_buff.data();
+    as_int[0] = length;
+    as_int[1] = perCfg_.resp;
     queueSend(connection);
   }
 
@@ -1219,7 +1230,8 @@ class EpollSender : public ISender {
 
   void doConnect() {
     for (int i = 0; i < perCfg_.per_thread; i++) {
-      std::this_thread::sleep_for(std::chrono::microseconds(100 * perCfg_.threads));
+      std::this_thread::sleep_for(
+          std::chrono::microseconds(100 * perCfg_.threads));
       if (addConnection()) {
         successConnects_++;
       } else {
