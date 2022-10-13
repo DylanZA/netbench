@@ -207,10 +207,10 @@ std::pair<struct io_uring, IoUringRxConfig> mkIoUring(
   struct io_uring ring;
   memset(&params, 0, sizeof(params));
 
-  // default to 8x sqe_count as we are very happy to submit multiple sqe off one
+  // default to Nx sqe_count as we are very happy to submit multiple sqe off one
   // cqe (eg send,read) and this can build up quickly
   int cqe_count =
-      rx_cfg.cqe_count <= 0 ? 8 * rx_cfg.sqe_count : rx_cfg.cqe_count;
+      rx_cfg.cqe_count <= 0 ? 128 * rx_cfg.sqe_count : rx_cfg.cqe_count;
 
   unsigned int newer_flags =
       IORING_SETUP_SUBMIT_ALL | IORING_SETUP_COOP_TASKRUN;
