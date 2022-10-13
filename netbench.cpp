@@ -398,7 +398,7 @@ class RxStats {
           buff,
           sizeof(buff),
           "%s: rps:%6.2fk Bps:%6.2fM idle=%lums "
-          "user=%lums system=%lums wall=%lums loops=%lu overflows=%lu",
+          "user=%lums system=%lums wall=%lums loops=%lu overflows=%lu files=%s",
           name_.c_str(),
           rps / 1000.0,
           bps / 1000000.0,
@@ -407,7 +407,8 @@ class RxStats {
           getMs(lastTimes_.tms_stime, times_now.tms_stime).count(),
           getMs(lastClock_, clock_now).count(),
           loops_,
-          overflows_);
+          overflows_,
+          nrFilesStr().c_str());
       if (written >= 0) {
         std::array<char, 2048> read_stats_buf;
         std::string_view read_stats;

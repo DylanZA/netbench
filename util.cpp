@@ -1,10 +1,11 @@
 #include "util.h"
 
-#include <atomic>
 #include <fcntl.h>
 #include <stdio.h>
 #include <sys/syscall.h>
 #include <sys/types.h>
+#include <atomic>
+#include <string_view>
 
 namespace po = boost::program_options;
 
@@ -112,7 +113,8 @@ void runWorkload(unsigned int outer, unsigned int inner) {
 #ifdef __i386__
       __builtin_ia32_pause();
 #elif __arm__
-      asm volatile("yield");.
+      asm volatile("yield");
+      .
 #endif
     } while (std::chrono::steady_clock::now() < end);
     syscall(99999999);
@@ -124,4 +126,26 @@ void runWorkload(unsigned int outer, unsigned int inner) {
         "us loops=",
         loops);
   }
+}
+
+std::string nrFilesStr() {
+  char buff[256];
+  int f = ::open("/proc/sys/fs/file-nr", O_RDONLY);
+  if (f < 0) {
+    return "<couldnt open>";
+  }
+
+  ssize_t got = ::read(f, &buff, sizeof(buff));
+  ::close(f);
+
+  if (got < 0) {
+    return "<bad read>";
+  }
+
+  std::string_view sv{buff, (size_t)got};
+  auto sp = sv.find('\t');
+  if (sp == std::string_view::npos) {
+    return "<no tab>";
+  }
+  return std::string{sv.substr(0, sp)};
 }
